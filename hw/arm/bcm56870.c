@@ -517,6 +517,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCMTimerState, BCM_TIMER)
 /* Tick period in virtual nanoseconds. */
 #define BCM_TIMER_TICK_NS  (10 * 1000 * 1000)
 
+/*
+ * The one-shot delay timer's unit conversion.
+ *
+ * FUN_00003754 programs the countdown as
+ *      count = (remaining_ns * 1000) / scale        scale = *DAT_00003794 = 1166
+ * so inverting, the countdown registers tick at scale/1000 ns each:
+ *      ns = count * 1166 / 1000
+ *
+ * Verified against the firmware's own arm value: FUN_00002628(10000, 0) produces
+ * count = 10000 * 1000 / 1166 = 8576, which is exactly what is observed.
+ * Multiplying by 100000 instead -- an earlier error here -- made a 10 microsecond
+ * delay look like 857 ms and a 1-second delay like 24 hours, so nothing ever
+ * appeared to expire.
+ */
+#define BCM_DELAY_SCALE_NUM  1166
+#define BCM_DELAY_SCALE_DEN  1000
+
+
 /* The scheduler tick is published on IRQ 8, as the firmware itself sets up. */
 #define BCM_TIMER_IRQ      8
 
@@ -525,19 +543,42 @@ struct BCMTimerState {
     MemoryRegion iomem;
 
     QEMUTimer tick;
-    qemu_irq irq;
+    QEMUTimer delay;
+    qemu_irq irq;                /* periodic scheduler tick  -> line 8 */
+    qemu_irq delay_irq;          /* one-shot delay timer     -> line 9 */
 
     uint32_t regs[BCM_TIMER_SIZE / 4];
-    uint32_t counter;
+    uint64_t counter;             /* 64-bit: it is a nanosecond counter */
+    uint32_t counter_lo;          /* what the low register reads back */
+    int64_t last_ns;
     bool enabled;
 };
 
 static void timer_tick(void *opaque)
 {
     BCMTimerState *s = BCM_TIMER(opaque);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    /* The counter is free-running and always advances. */
-    s->counter++;
+    /*
+     * The counter is a free-running NANOSECOND counter, advanced in proportion
+     * to elapsed virtual time rather than by one per tick.
+     *
+     * This matters more than it looks.  mos_uptime_ticks() reads this register
+     * to decide "now", and the firmware expresses timeouts in the same units:
+     * the mailbox wait arms timer 0x49 with 0x2540BE400 = 10,000,000,000, which
+     * is 10 seconds only if the counter advances 1e9 per second.  An earlier
+     * version of this device advanced it by +1 per 10 ms tick -- a factor of
+     * 1e7 too slow -- so no scheduler timeout ever expired and every thread
+     * that slept on one (the host-message thread among them) slept forever.
+     */
+    if (s->last_ns == 0) {
+        s->last_ns = now;
+    }
+    if (now > s->last_ns) {
+        s->counter += (uint64_t)(now - s->last_ns);
+        s->last_ns = now;
+    }
+    s->counter_lo = (uint32_t)s->counter;
 
     if (s->enabled) {
         /*
@@ -551,6 +592,14 @@ static void timer_tick(void *opaque)
 
     timer_mod(&s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
               + BCM_TIMER_TICK_NS);
+}
+
+/* One-shot delay expiry: assert line 9 so the firmware expires its delay list. */
+static void timer_delay_expire(void *opaque)
+{
+    BCMTimerState *s = BCM_TIMER(opaque);
+    s->regs[0x028 / 4] = 0;          /* the timer is no longer armed */
+    qemu_irq_raise(s->delay_irq);
 }
 
 static uint64_t timer_read(void *opaque, hwaddr offset, unsigned size)
@@ -568,9 +617,15 @@ static uint64_t timer_read(void *opaque, hwaddr offset, unsigned size)
      * from 0x82000, or +0x24 from 0x82020.
      */
     if (offset == 0x004 || offset == 0x024) {
-        return s->counter;
+        return s->counter_lo;
     }
 
+    /*
+     * +0x08 is the MODE register (the firmware writes 0x62 then 0xE2), not the
+     * counter's high word.  mos_uptime_ticks() builds its 64-bit value from two
+     * separate pointers it maintains, so the counter does not need a latched
+     * high half here -- and returning one clobbers the mode byte.
+     */
     return s->regs[idx];
 }
 
@@ -590,14 +645,62 @@ static void timer_write(void *opaque, hwaddr offset, uint64_t value,
      */
     if (offset == 0x004) {
         s->counter = value;
+        s->counter_lo = value;
+        s->last_ns = 0;
+        return;
+    }
+
+    /*
+     * Block B -- the ONE-SHOT delay timer at 0x00082020.
+     *
+     * FUN_00003754 arms it as:   [0x20] = countdown ; [0x28] = 0xA3 (arm)
+     * and FUN_00001d94 then suspends the calling thread.  The matching wake is
+     * IRQ 9, whose handler (0x3798 -> sched_timer_tick) expires the delay list.
+     *
+     * This is the gate that was blocking everything: the System msg thread's
+     * first act is FUN_00002628(10000, 0), which arms this timer and suspends.
+     * Only IRQ 8 was ever raised, so the thread suspended forever, never
+     * evaluated its send window, never sent a request, and FUN_00006e88 -- the
+     * "BFD ready" call -- was never reached.
+     */
+    if (offset == 0x028) {
+        s->regs[offset / 4] = value;
+        if (value == 0xa3) {
+            /* Arm: schedule the one-shot to fire after `countdown` ticks. */
+            uint32_t count = s->regs[0x020 / 4];
+            int64_t ns = (int64_t)count * BCM_DELAY_SCALE_NUM / BCM_DELAY_SCALE_DEN;
+            if (ns < 1000) {
+                ns = 1000;
+            }
+
+            timer_mod(&s->delay, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
+        }
         return;
     }
 
     s->regs[idx] = value;
 
     if (offset == 0x00c) {
-        /* Control: once set, the block delivers periodic interrupts. */
+        /*
+         * Control: once set, the block delivers periodic interrupts.
+         *
+         * Enabling also publishes the period at +0x10.  The firmware never
+         * writes +0x10 itself (FUN_00003700 programs +0x00, +0x04, +0x08 and
+         * +0x0C only), but its IRQ-8 handler gates the entire scheduler timer
+         * wheel behind a non-zero read of it:
+         *
+         *     if (_DAT_00082010 == 0) {
+         *         return 0;            // wheel never advances
+         *     }
+         *
+         * so leaving it at zero silently stops every timeout in the system.
+         * Publish the period in the same nanosecond units as the counter that
+         * mos_uptime_ticks() reads.
+         */
         s->enabled = (value != 0);
+        if (s->enabled) {
+            s->regs[0x010 / 4] = (uint32_t)BCM_TIMER_TICK_NS;
+        }
     }
 }
 
@@ -618,7 +721,9 @@ static void timer_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
 
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->delay_irq);
     timer_init_ns(&s->tick, QEMU_CLOCK_VIRTUAL, timer_tick, s);
+    timer_init_ns(&s->delay, QEMU_CLOCK_VIRTUAL, timer_delay_expire, s);
 }
 
 static void timer_reset(DeviceState *dev)
@@ -627,8 +732,11 @@ static void timer_reset(DeviceState *dev)
 
     memset(s->regs, 0, sizeof(s->regs));
     s->counter = 0;
+    s->counter_lo = 0;
+    s->last_ns = 0;
     s->enabled = false;
     timer_del(&s->tick);
+    timer_del(&s->delay);
     timer_mod(&s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
               + BCM_TIMER_TICK_NS);
 }
@@ -1114,6 +1222,504 @@ static const MemoryRegionOps strap_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+/*
+ * ------------------------------------------------------------------
+ * CMICx responder.
+ *
+ * CMICx is the firmware's control fabric: every off-chip operation is a request
+ * descriptor whose reply is routed back to the requesting thread.  The host
+ * side of that fabric is what we have to stand in for, because BFD start-up is
+ * triggered by CMICx messages and nothing else will start it.
+ *
+ * THE MAILBOX HANDSHAKE, read off FUN_00003cb0 (the "Host msg" thread):
+ *
+ *     host = 0x59734 + hostidx * 0x634          (four hosts)
+ *     *(host+0x0C) = pointer the firmware READS  (host -> firmware)
+ *     *(host+0x10) = pointer the firmware WRITES (firmware -> host)
+ *     *(host+0x08) = the firmware's local state
+ *
+ *     loop {
+ *         firmware_state = 1; publish; while ((READ  & 3) != 1) sleep();
+ *         firmware_state = 2; publish; while ((READ  & 3) != 2) sleep();
+ *         firmware_state = 3; publish; while ((READ  & 3) != 3) sleep();
+ *         process the message; repeat
+ *     }
+ *
+ * So the host must walk the input word through 1, 2 and 3 once per message.
+ * The firmware publishes its own progress to the output word in the same order,
+ * which gives a simple and race-free rule: MIRROR the phase.
+ *
+ * PACING.  The wait loop is NOT interrupt-driven.  It arms scheduler timer
+ * 0x49 with a timeout and sleeps:
+ *
+ *     *puVar6 |= 0x200;                        enable a bit in the bitmap
+ *     *(*DAT_00003f64 + 0x10) = 0x200;         write it to the controller
+ *     FUN_00001a10(0x49, 0x2540BE400, 0);      arm timer 0x49 for 10 s
+ *
+ * and DAT_00003f6c/f70 is 0x2540BE400 = 10,000,000,000 ns -- a ten-second
+ * timeout.  Timer slot 0x49 lives at 0x54FD8 + 0x49*0x38 = 0x55FD0 in BSS; it
+ * is a SCHEDULER timer, not an interrupt line, and nothing in the firmware ever
+ * raises line 9 for this.  (An earlier version of this device asserted IRQ 9
+ * as a "doorbell", reading 0x200 as an IRQ number.  That was wrong: 0x200 is an
+ * interrupt-ENABLE bit, and the wait is purely timeout-paced.)
+ *
+ * So the firmware re-samples the phase only when its 10-second timer expires.
+ * The responder must therefore MIRROR the phase and then WAIT -- a full
+ * three-phase exchange takes tens of seconds of guest time, and that is the
+ * firmware's own pacing, not a stall.
+ * ------------------------------------------------------------------
+ */
+#define TYPE_BCM_CMICX "bcm56870-cmicx"
+OBJECT_DECLARE_SIMPLE_TYPE(BCMCMICXState, BCM_CMICX)
+
+#define CMICX_HOST_BASE    0x00059734
+#define CMICX_HOST_STRIDE  0x634
+#define CMICX_HOST_OFF_IN  0x0c
+#define CMICX_HOST_OFF_OUT 0x10
+#define CMICX_HOST_OFF_ST  0x08
+
+/* Poll period in virtual nanoseconds. */
+#define CMICX_POLL_NS      (1000 * 1000)
+
+/*
+ * How many polls to keep a round open before closing it.  The System msg thread
+ * sleeps in 10000-unit delays between checks of the send window, so the window
+ * must stay open for noticeably longer than one poll.
+ */
+#define CMICX_ROUND_HOLD_POLLS  3000
+
+struct BCMCMICXState {
+    SysBusDevice parent_obj;
+    QEMUTimer poll;
+    qemu_irq irq;                /* the host-message wake line (73) */
+    AddressSpace *as;
+    bool attached[4];
+    bool sent;
+    bool answered;
+    uint32_t last_slot;
+    int stage;
+    int round_hold;
+    uint32_t last_phase[4];
+};
+
+static uint32_t cmicx_rd32(AddressSpace *as, uint32_t addr)
+{
+    uint8_t b[4];
+    address_space_read(as, addr, MEMTXATTRS_UNSPECIFIED, b, 4);
+    return ldl_le_p(b);
+}
+
+static void cmicx_wr32(AddressSpace *as, uint32_t addr, uint32_t v)
+{
+    uint8_t b[4];
+    stl_le_p(b, v);
+    address_space_write(as, addr, MEMTXATTRS_UNSPECIFIED, b, 4);
+}
+
+/*
+ * Host side of the handshake.
+ *
+ * The firmware publishes its phase to OUT and then waits for the SAME value in
+ * IN before advancing to the next phase:
+ *
+ *     publish 1 -> wait IN==1 -> publish 2 -> wait IN==2 -> publish 3 -> wait IN==3
+ *
+ * so the host simply echoes the firmware's published phase back into IN.  We
+ * keep the last value we granted per host so we do not rewrite the word on
+ * every poll (the firmware samples it between ten-second sleeps, and rewriting
+ * constantly made the exchange look stalled in earlier testing).
+ */
+/*
+ * Build and enqueue one CMICx message, so the firmware has work to do.
+ *
+ * The firmware polls its receive queue and dispatches on the message opcode.
+ * The opcode that starts BFD is 2, and it additionally requires
+ * revsh(payload[0x36]) == 1 (dispatch at 0x43c4 in FUN_00004278):
+ *
+ *     opcode == 2 && revsh(msg[0x36]) == 1
+ *         -> bl FUN_00006e88        creates "BfdMsgThread", logs "BFD ready"
+ *
+ * The node is a dlist entry pushed onto the queue that FUN_00003fc0 pops from:
+ *     host + param_2*8 + 0x2bc     with host 0, param_2 = 1  ->  0x599f8
+ * and the queue head it parks on when empty is host + param_2*8 + 0x50c.
+ *
+ * Node layout (a mos_dlist_node):
+ *     +0x00 next        +0x04 prev
+ *     +0x08 word A      +0x0c word B     (the message handles)
+ *     +0x1c status
+ */
+/*
+ * How the firmware actually exchanges messages (from FUN_00004278/
+ * FUN_00003fc0):
+ *
+ *   FUN_00004278(host, chan, param_3, ...)
+ *       node = FUN_00003fc0(host, chan, ...)   pops from host+chan*8+0x2bc
+ *       if (node != param_3) log_fatal("Msg receive got a different msg")
+ *
+ * so the node that comes back off the queue MUST be the caller's own buffer.
+ * The firmware posts its request buffer and waits for the host to fill that
+ * same buffer and hand the identical pointer back -- the reply is matched by
+ * pointer identity, not by content.  Inventing our own node would make the
+ * firmware's comparison fail.
+ *
+ * The caller then reads the reply out of its stack buffer param_3, which is
+ * copied from the posted node.  The dispatcher indexes it as:
+ *      opcode  at +0x11   (sp+0x35 with the buffer at sp+0x24)
+ *      payload at +0x12   (sp+0x36, the value revsh() is applied to)
+ *      word    at +0x14   (sp+0x38)
+ *
+ * So the responder's job is: watch the queues the firmware parks requests on,
+ * and when one appears, fill its buffer in place and mark it done.  It must NOT
+ * fabricate a node.
+ */
+
+static uint32_t cmicx_rd32(AddressSpace *as, uint32_t addr);
+static void cmicx_wr32(AddressSpace *as, uint32_t addr, uint32_t v);
+
+/*
+ * The firmware posts its request buffer on host+chan*8+0x3e4
+ * (FUN_00004040 pushes it there when the host state is 3) and then waits in
+ * FUN_00003fc0, which pops the reply from host+chan*8+0x2bc.  So the host's job
+ * is:
+ *
+ *     take the posted buffer off  +0x3e4
+ *     fill in the reply fields
+ *     push the SAME buffer onto     +0x2bc
+ *
+ * Keeping the same pointer matters: FUN_00004278 compares the buffer it gets
+ * back against the caller's own buffer and log_fatal()s if they differ
+ * ("Msg receive got a different msg").  Only the content may change.
+ */
+/*
+ * Fill a reply into the firmware's own posted buffer.
+ *
+ * The dispatcher in FUN_000042e8 (the "System msg" thread) reads the buffer it
+ * posted as its stack frame at sp+0x24, so the field offsets are:
+ *
+ *      +0x11   opcode        (sp+0x35)
+ *      +0x12   halfword      (sp+0x36) -- passed through revsh()
+ *      +0x14   word          (sp+0x38) -- passed through bswap32()
+ *      +0x1c   status        (sp+0x40), tested == 1 for success
+ *
+ * The BFD-start condition is  status == 1 && opcode == 2 &&
+ * revsh(halfword) == 1.  revsh byte-reverses the 16-bit value, so the RAW
+ * halfword must be 0x0100 for revsh to yield 1.  Writing 0x0001 there -- which
+ * an earlier version did -- makes revsh return 0 and the branch is never taken.
+ *
+ * Note the status is 1 here, not 0x81: 0x80/0x81 belong on REQUEST descriptors
+ * (FUN_0000408c waits while (status - 0x80) < 2), whereas this is the value the
+ * receiver compares against 1.
+ */
+static void cmicx_fill_reply(BCMCMICXState *s, uint32_t node, uint8_t opcode,
+                             uint16_t raw_halfword, uint32_t word)
+{
+    uint8_t b[4];
+
+    /* +0x10: byte 1 = opcode, bytes 2..3 = the raw halfword (little-endian) */
+    b[0] = 0;
+    b[1] = opcode;
+    b[2] = raw_halfword & 0xff;
+    b[3] = (raw_halfword >> 8) & 0xff;
+    address_space_write(s->as, node + 0x10, MEMTXATTRS_UNSPECIFIED, b, 4);
+
+    cmicx_wr32(s->as, node + 0x14, word);
+
+    /* status: FUN_000042e8 requires exactly 1 */
+    cmicx_wr32(s->as, node + 0x1c, 1);
+}
+
+/* Pop one node from a dlist, or 0 when empty. */
+static uint32_t cmicx_dlist_pop(BCMCMICXState *s, uint32_t list)
+{
+    uint32_t node = cmicx_rd32(s->as, list);
+
+    if (node == list || node < 0x1000 || node > 0x800000) {
+        return 0;
+    }
+    {
+        uint32_t next = cmicx_rd32(s->as, node + 0x00);
+        if (next < 0x1000) {
+            return 0;
+        }
+        cmicx_wr32(s->as, list, next);
+        cmicx_wr32(s->as, next + 0x04, list);
+        cmicx_wr32(s->as, node + 0x00, 0);
+        cmicx_wr32(s->as, node + 0x04, 0);
+    }
+    return node;
+}
+
+/* Push a node onto the tail of a dlist. */
+static void cmicx_dlist_push(BCMCMICXState *s, uint32_t list, uint32_t node)
+{
+    uint32_t tail = cmicx_rd32(s->as, list + 0x04);
+
+    if (tail < 0x1000) {
+        tail = list;
+    }
+    cmicx_wr32(s->as, node + 0x00, list);
+    cmicx_wr32(s->as, node + 0x04, tail);
+    cmicx_wr32(s->as, tail + 0x00, node);
+    cmicx_wr32(s->as, list + 0x04, node);
+}
+
+static void cmicx_poll(void *opaque)
+{
+    BCMCMICXState *s = BCM_CMICX(opaque);
+    bool deliver = false;
+
+    /*
+     * 1. Drive the mailbox handshake.
+     *
+     * The firmware publishes a phase to the output word and waits for the same
+     * value in the input word, so we grant whatever it has published.
+     */
+    for (int h = 0; h < 4; h++) {
+        uint32_t host = CMICX_HOST_BASE + h * CMICX_HOST_STRIDE;
+        uint32_t in_ptr, out_ptr, in_word, out_word, fw, granted;
+
+        in_ptr  = cmicx_rd32(s->as, host + CMICX_HOST_OFF_IN);
+        out_ptr = cmicx_rd32(s->as, host + CMICX_HOST_OFF_OUT);
+
+        /* Published only once the firmware is up, and they live in guest RAM,
+         * so bound-check before dereferencing. */
+        if (in_ptr < 0x1000 || out_ptr < 0x1000) {
+            continue;
+        }
+
+        out_word = cmicx_rd32(s->as, out_ptr);
+        in_word  = cmicx_rd32(s->as, in_ptr);
+        fw       = out_word & 3u;
+        granted  = in_word & 3u;
+
+        if (fw != 0 && fw != granted && in_ptr != out_ptr) {
+            cmicx_wr32(s->as, in_ptr, (in_word & ~3u) | fw);
+            deliver = true;
+        }
+
+        /*
+         * Complete any request the firmware has sent.
+         *
+         * FUN_00003a80 walks the slot array at host+0x24+i*4, and for every
+         * occupied slot:
+         *     slot[i] = 0;
+         *     if (*(node+0x1c) == 0x81)
+         *         *(node+0x1c) = (IN >> (i + 0x10)) & 1;
+         *     while (pop(node+8)) sched_add_thread(...);
+         *
+         * so the host completes slot i by setting bit (16+i) in the input word,
+         * and advances the index in bits[9:6] to make the walk visit it.  This
+         * has to run on its own, not only when a phase changes: once the phase
+         * handshake settles at 3 the firmware is holding an outstanding request
+         * and waiting for exactly this.
+         */
+        if (fw == 3 && in_ptr != out_ptr) {
+            for (int i = 0; i < 4; i++) {
+                uint32_t node = cmicx_rd32(s->as, host + 0x24 + i * 4);
+
+                if (!node) {
+                    continue;
+                }
+                in_word = cmicx_rd32(s->as, in_ptr);
+                {
+                    uint32_t idx = ((in_word & 0x3ffu) >> 6) + 1;
+                    uint32_t new_in = (in_word & ~0x3ffu)
+                                      | ((idx & 0xf) << 6)
+                                      | (1u << (16 + i));
+                    cmicx_wr32(s->as, in_ptr, new_in);
+                    deliver = true;
+                }
+                break;
+            }
+        }
+    }
+
+    /*
+     * 1b. Deliver replies and complete requests, exactly as FUN_00003a80 does.
+     *
+     * That function runs two independent index walks, both driven by the single
+     * input word the HOST writes:
+     *
+     *   slot walk   bits[9:6]   host+0x24+i*4
+     *       node = slot[i]; slot[i] = 0;
+     *       if (node+0x1c == 0x81) node+0x1c = (IN >> (16+i)) & 1;
+     *       wake waiters from node+8
+     *
+     *   handle walk bits[5:2]
+     *       hA = bswap32(*(IN + i*8 + 4));
+     *       hB = bswap32(*(IN + (i+1)*8));
+     *       dev  = hA & 0xff;
+     *       node = pop(host + dev*8 + 0x3e4);     <-- the FIRMWARE's posted buffer
+     *       node+0x10 = hA;  node+0x14 = hB;  node+0x1c = 1;
+     *       wake the waiter parked on host + dev*8 + 0x50c
+     *
+     * Each walk spans saved_index..current_index, where "saved" is host+4 (the
+     * input word as of last time) -- so the host must ADVANCE the index or the
+     * loop body never executes.  And (IN & 3) == 1 returns 1 immediately without
+     * walking at all, so completion cannot be folded into the phase-1 write that
+     * ends the round.
+     *
+     * The reply payload therefore travels as handle A.  The dispatcher in
+     * FUN_000042e8 reads the buffer it gets back as:
+     *     +0x11  opcode            (byte 1 of node+0x10)
+     *     +0x12  halfword          (bytes 2..3 of node+0x10, through revsh)
+     * so handle A = 0x01000200 gives opcode 2 and a raw halfword of 0x0100,
+     * whose revsh is 1 -- the BFD-start message.  It is stored byte-swapped
+     * because the firmware applies bswap32 to what it reads.
+     */
+    for (int h = 0; h < 4; h++) {
+        uint32_t host = CMICX_HOST_BASE + h * CMICX_HOST_STRIDE;
+        uint32_t in_ptr  = cmicx_rd32(s->as, host + CMICX_HOST_OFF_IN);
+        uint32_t out_ptr = cmicx_rd32(s->as, host + CMICX_HOST_OFF_OUT);
+        uint32_t in_word, out_word;
+        bool posted = false, slot = false;
+
+        /* Aliased IN/OUT share one word, so no distinct phase can be granted. */
+        if (in_ptr < 0x1000 || out_ptr < 0x1000 || in_ptr == out_ptr) {
+            continue;
+        }
+        out_word = cmicx_rd32(s->as, out_ptr);
+        if ((out_word & 3u) != 3u) {
+            s->stage = 0;              /* only inside the open round */
+            continue;
+        }
+
+        /* The firmware posts its receive buffer on channel 0 via FUN_00004040. */
+        posted = cmicx_rd32(s->as, host + 0x3e4) != (host + 0x3e4);
+        for (int i = 0; i < 16; i++) {
+            if (cmicx_rd32(s->as, host + 0x24 + i * 4)) {
+                slot = true;
+                break;
+            }
+        }
+
+        in_word = cmicx_rd32(s->as, in_ptr);
+
+        if (posted && s->stage == 0) {
+            cmicx_wr32(s->as, in_ptr + 4, 0x00020001);   /* handle A */
+            cmicx_wr32(s->as, in_ptr + 8, 0x00000000);   /* handle B */
+            cmicx_wr32(s->as, in_ptr,
+                       (in_word & ~0x3ffu) | 3u
+                       | (1u << 2) | (1u << 6) | (1u << 16));
+            s->stage = 1;
+            deliver = true;
+        } else if (s->stage == 1) {
+            /* Return to phase 1 so the spin exits and Host msg drains. */
+            cmicx_wr32(s->as, in_ptr, (in_word & ~3u) | 1u);
+            s->stage = 2;
+            deliver = true;
+        } else if (!posted && !slot && s->stage == 2) {
+            s->stage = 0;              /* consumed; ready for the next round */
+        }
+    }
+
+    /*
+     * 3. The host-message interrupt line.
+     *
+     * The firmware's wait loop enables bit 9 of enable-word 2 -- absolute line
+     * 73 -- immediately before sleeping, and slot 73 has no handler, so
+     * irq_dispatch skips the call and invokes sched_timer_expire on wheel
+     * 0x55FD8 directly.  That is what makes the sleeping thread runnable, so
+     * raise the line whenever we have changed something for it to see.  A held
+     * level is correct: the controller latches the request and the acknowledge
+     * releases the input.
+     */
+    if (deliver) {
+        qemu_irq_raise(s->irq);
+    }
+
+    timer_mod(&s->poll, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + CMICX_POLL_NS);
+}
+
+static void cmicx_realize(DeviceState *dev, Error **errp)
+{
+    BCMCMICXState *s = BCM_CMICX(dev);
+
+    s->as = &address_space_memory;
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+    timer_init_ns(&s->poll, QEMU_CLOCK_VIRTUAL, cmicx_poll, s);
+}
+
+static void cmicx_reset(DeviceState *dev)
+{
+    BCMCMICXState *s = BCM_CMICX(dev);
+    memset(s->attached, 0, sizeof(s->attached));
+    s->sent = false;
+    s->answered = false;
+    s->last_slot = 0;
+    s->stage = 0;
+    s->round_hold = 0;
+    memset(s->last_phase, 0, sizeof(s->last_phase));
+    timer_del(&s->poll);
+    timer_mod(&s->poll, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + CMICX_POLL_NS);
+}
+
+static void cmicx_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->realize = cmicx_realize;
+    device_class_set_legacy_reset(dc, cmicx_reset);
+}
+
+static const TypeInfo cmicx_info = {
+    .name = TYPE_BCM_CMICX,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(BCMCMICXState),
+    .class_init = cmicx_class_init,
+};
+
+/*
+ * ------------------------------------------------------------------
+ * System uptime counter at 0x03235000.
+ *
+ * mos_uptime_ticks() (0x1fb4) reads its 64-bit "now" from two register
+ * pointers: 0x0323501C (low) and 0x03235020 (high).  The scheduler arms
+ * deadlines as now + timeout and fires them when "now" reaches the deadline,
+ * so this counter has to be real.
+ *
+ * It was previously inside the unimplemented "intc-status" window, which made
+ * every read return 0.  With "now" pinned at zero, a deadline of
+ * 0 + 0x2540BE400 could never be met and NO scheduler timeout ever expired --
+ * the host-message thread among them, which is why it slept forever after
+ * arming its 10-second timer.
+ *
+ * Units are nanoseconds: the firmware's own 10-second constant is
+ * 0x2540BE400 = 10,000,000,000, so this must advance 1e9 per second.
+ * ------------------------------------------------------------------
+ */
+static uint64_t uptime_ns(void)
+{
+    return (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+static uint64_t uptime_read(void *opaque, hwaddr offset, unsigned size)
+{
+    uint64_t now = uptime_ns();
+
+    switch (offset) {
+    case 0x1c:                      /* low word  -- read first */
+        return (uint32_t)now;
+    case 0x20:                      /* high word -- read second */
+        return (uint32_t)(now >> 32);
+    default:
+        return 0;
+    }
+}
+
+static void uptime_write(void *opaque, hwaddr offset, uint64_t value,
+                         unsigned size)
+{
+    /* read-only counter */
+}
+
+static const MemoryRegionOps uptime_ops = {
+    .read = uptime_read,
+    .write = uptime_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
 /* ------------------------------------------------------------------ */
 /* The machine                                                        */
 /* ------------------------------------------------------------------ */
@@ -1128,6 +1734,7 @@ struct BCM56870State {
     BCMIntcState *intc;
     BCMTimerState *timer;
     MemoryRegion strap_iomem;
+    MemoryRegion uptime_iomem;
     uint8_t strap[0x7c];
     SerialMM *uart0;
     SerialMM *uart1;
@@ -1188,6 +1795,9 @@ static void bcm56870_init(MachineState *machine)
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        qdev_get_gpio_in_named(DEVICE(s->intc), "src",
                                               BCM_TIMER_IRQ));
+    /* Output 1: the one-shot delay line, which the firmware registers on 9. */
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
+                       qdev_get_gpio_in_named(DEVICE(s->intc), "src", 9));
     s->timer = BCM_TIMER(dev);
 
     /* --- Chip ID --------------------------------------------------- */
@@ -1218,6 +1828,18 @@ static void bcm56870_init(MachineState *machine)
                                                      BCM_UART1_IRQ),
                               1843200, serial_hd(1), DEVICE_LITTLE_ENDIAN);
 
+    /* --- CMICx responder (host side of the control fabric) -------- */
+    dev = qdev_new(TYPE_BCM_CMICX);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    /*
+     * The firmware's host-message wait enables bit 9 of enable-word 2, which is
+     * absolute interrupt line 73, and arms timer 0x49 (decimal 73) -- the same
+     * number.  Slot 73 has no handler, so irq_dispatch calls
+     * sched_timer_expire directly on wheel 0x55FD8, waking the sleeping thread.
+     */
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in_named(DEVICE(s->intc), "src", 73));
+
     /* --- Ethernet front-end for the DMA rings --------------------- */
     dev = qdev_new(TYPE_BCM_ETH);
     qdev_realize_and_unref(dev, NULL, &error_fatal);
@@ -1230,7 +1852,22 @@ static void bcm56870_init(MachineState *machine)
     /* --- Mark remaining device windows as unimplemented ----------- */
     create_unimplemented_device("bcm56870.pktdma", 0x03205000, 0x1000);
     create_unimplemented_device("bcm56870.pktdma-desc", 0x03206400, 0x100);
-    create_unimplemented_device("bcm56870.intc-status", 0x03235000, 0x100);
+    /*
+     * System uptime counter at 0x03235000.
+     *
+     * mos_uptime_ticks() reads a 64-bit free-running value from 0x0323501C
+     * (low) and 0x03235020 (high), and the scheduler compares deadlines against
+     * it.  This window used to be an unimplemented device, so every read
+     * returned 0: "now" never advanced, no deadline was ever reached, and every
+     * thread that slept on a timeout slept forever -- which is precisely why
+     * the host-message thread armed its 10-second timer and never woke.
+     *
+     * The unit is nanoseconds: the firmware's own 10-second timeout constant is
+     * 0x2540BE400 = 10,000,000,000, so the counter must advance 1e9 per second.
+     */
+    memory_region_init_io(&s->uptime_iomem, OBJECT(machine), &uptime_ops,
+                          s, "bcm56870.uptime", 0x100);
+    memory_region_add_subregion(sysmem, 0x03235000, &s->uptime_iomem);
     /*
      * Strap/pinmux scratch.  The firmware uses these as ordinary
      * read-modify-write bits (FUN_000039b4 ORs bit 0, FUN_000039d8 clears
@@ -1359,6 +1996,7 @@ static void bcm56870_register_types(void)
     type_register_static(&timer_info);
     type_register_static(&pktdma_info);
     type_register_static(&eth_info);
+    type_register_static(&cmicx_info);
     type_register_static(&bcm56870_machine_type);
 }
 
