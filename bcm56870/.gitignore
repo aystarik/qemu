@@ -1,0 +1,5 @@
+# The vendor firmware image is not redistributable and is located at runtime
+# by harness/common.py (or via $BCM56870_IMAGE).  If you drop a copy here,
+# it stays out of git.
+firmware/
+__pycache__/

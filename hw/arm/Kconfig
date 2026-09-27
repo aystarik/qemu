@@ -85,6 +85,13 @@ config MAX78000FTHR
     depends on TCG && ARM
     select MAX78000_SOC
 
+config BCM56870
+    bool
+    default y
+    depends on TCG && ARM
+    select SERIAL
+    select UNIMP
+
 config MPS3R
     bool
     default y
