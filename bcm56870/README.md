@@ -202,6 +202,219 @@ counter advances (13.9e12 → 23.8e12 over 10 s of wall time, so the plumbing is
 correct) but the scale does not correspond to real hardware. Treat these as
 "the mechanism works", not as measurements.
 
+
+## Packet DMA and the ethernet front-end
+
+The firmware does not drive a MAC register block. It parks receive buffers in a
+descriptor ring, and for transmit it builds a descriptor and rings a doorbell.
+So `bcm56870-pktdma` and `bcm56870-eth` stand in for the DMA/MAC boundary.
+
+### Why the DMA has to be real
+
+`pkt_dma_xfer` (0x4938) **polls its status register** until `(status & 3) != 0`.
+Under the previous RAZ/WI treatment that read 0 forever, so any transfer hung.
+The engine now performs a genuine memory-to-memory copy of `len` words and
+raises the status.
+
+Two descriptor banks, 0x80 apart, selected by the flag byte at `0x54FBC`:
+
+| | bank A | bank B |
+|---|---|---|
+| src_lo | `0x03206404` | `0x03206484` |
+| src_hi | `0x03206408` | `0x03206488` |
+| dst_lo | `0x0320640C` | `0x0320648C` |
+| dst_hi | `0x03206410` | `0x03206490` |
+| length (words) | `0x03206414` | `0x03206494` |
+| control | `0x03206418` | `0x03206498` |
+| status | `0x0320641C` | `0x0320649C` |
+
+Register 0 is the **source** and register 1 the **destination**.
+`harness/dmatest.py` verifies a real transfer through the guest's own code path
+(note that GDB's `set {int}ADDR` bypasses MMIO, so a transfer only happens when
+guest code performs it).
+
+### The receive ring
+
+Channel state, stride 0x18, base `DAT_00004cb0` (`0x5B03C`). The BFD receive
+path uses **channel index 0xFF**, so its block is at `0x5C824`:
+
+| offset | meaning |
+|---|---|
+| `+0x04` | descriptor ring base (observed `0x5B2E8`) |
+| `+0x08` | ring size in entries (observed 128) |
+| `+0x10` | producer, advanced by enqueue |
+| `+0x14` | consumer, advanced by dequeue |
+
+A descriptor is 16 bytes; `+0x00` is the buffer's DMA address, `+0x08` holds the
+length in its low half, and **bit 31 of `+0x0C` means "the engine has filled
+this"**. `FUN_00004c48` dequeues by testing exactly that bit at the consumer
+index, then advances the consumer itself. So the front-end only has to fill the
+buffer, store the length, and set the owner bit — it must *not* touch the
+producer.
+
+> An earlier revision of this device raised bit 0 of `0x54FAC` as a "packet
+> available" flag. That word is an initialisation flag which reads 1
+> permanently, not a receive signal, so injected frames were never collected.
+
+### Can the DMA raise interrupts? No — and deliberately so
+
+This is worth stating plainly, because front-ending DMA with an interrupt is the
+obvious design and it would be wrong here:
+
+- **Only two interrupt handlers are ever installed** in the whole firmware:
+  line 8 (the scheduler tick) and line 9. There is no DMA handler.
+- The receive enqueue (`FUN_0000b740`) calls the descriptor builder with
+  `param_5 = 0, param_6 = 0`, so no completion interrupt is requested.
+- The completion wait in `FUN_00004d3c` is a **busy-loop on the owner bit**,
+  not a sleep-on-interrupt.
+- The host/packet handoff is a bit in a bitmap window that a thread **polls**.
+
+Raising an IRQ from the DMA device would therefore be inventing a signal the
+firmware never configured and has no handler for.
+
+### Status of the front-end
+
+**What is verified:**
+
+- the DMA engine copies memory correctly (`harness/dmatest.py`);
+- the device writes a frame plus the owner bit into the correct descriptor;
+- the firmware's own receive parser (`FUN_00008448`) is genuinely
+  ethernet-shaped and feeds `bfd_rx_packet`.
+
+**What is NOT yet demonstrated:** the firmware consuming an injected frame.
+`harness/bfdtest.py` injects a valid BFD Control packet and the owner bit is
+set, but the consumer index does not advance. **This is unresolved.**
+
+### Why BFD never starts, and what would be needed
+
+The blocker is not the ethernet front-end. The firmware learns about BFD
+sessions, and about the receive ring, over a **host message queue** — not over
+ethernet:
+
+```
+bfd_msg_thread (0x6114), blocked in FUN_00004204
+   <- host message 0x41  -> allocates the session table, then calls
+                            FUN_00007d3c / FUN_000099a0 / FUN_00006f48
+   <- host message 0x4a  -> FUN_00006f48 -> FUN_0000b834(0)
+                              -> FUN_0000b740 builds the 64-descriptor RX ring
+```
+
+`bfd_msg_thread` **never starts** in our runs (`"BFD ready"` is never printed),
+so there are no sessions, and an injected packet has nothing to match against.
+
+A "Host msg" poller thread (entry `0x3cb1`) does run and watches a shared-memory
+status word at `0x0127f000` — the host IN ring announced at boot. Getting BFD up
+means modelling that queue (producer/consumer plus its state machine) so the
+guest collects a `0x41` followed by a `0x4a` message itself.
+
+**Two model bugs found and fixed while investigating this:**
+
+1. **The chip-ID region was shadowing the strap registers.** It claimed a full
+   `0x1000` at `0x03241000`, so reads of the strap/pinmux block at
+   `0x03241784` returned the chip-ID value `0xb870`. The firmware does
+   read-modify-write there (`FUN_000039b4` sets a bit, then re-reads), so the
+   bit never stuck. The chip-ID region is now `0x100` and the strap block has
+   real backing storage — `0x03241788` now correctly reads back `1`.
+2. **Hijacking the CPU to call firmware routines wedges interrupts.** After a
+   gdb-driven `$pc`/`$cpsr` call returns, `CPSR` reads `0x1f3` (IRQs masked)
+   with the timer still pending in the controller, so nothing is ever scheduled
+   again. This is why threads created that way never run. It also explains the
+   earlier `--enable-irq` finding. Firmware routines invoked this way should be
+   treated as running in an environment where the scheduler is dead.
+
+## What it takes to verify the firmware reads a packet
+
+This is the honest answer to "how do we know the firmware consumed a frame?",
+and it is a scope statement as much as a plan.
+
+### The receive path is polled, so it *can* be driven — but the ring needs a host
+
+No DMA interrupt is ever configured (see above), so the receive path is a
+polling loop. In principle that means it can be exercised synchronously. The
+obstacle is not the polling: it is that **the receive ring only ever comes into
+existence as a consequence of a host message.**
+
+Verified by call graph:
+
+- `bfd_msg_thread` (`0x6114`) is the **only** caller of every function that
+  builds the ring:
+  - message `0x41` → `FUN_0000b980`, `FUN_00007d3c`, `FUN_000099a0`, `FUN_00006f48`
+  - message `0x4a` → `FUN_00006f48` → `FUN_0000b834(0)` → `FUN_0000b740`
+    (allocates the 64-descriptor ring at `0x5B2E8`)
+- `FUN_00006f48`'s **only** caller is `bfd_msg_thread` (at `0x6592`).
+
+So: no ring without `bfd_msg_thread`; no `bfd_msg_thread` without a host
+message. There is no console command that starts it.
+
+### The three ways to check, and which ones are legitimate
+
+**(A) Model the host mailbox — the only faithful option.**
+Reproduce, in the machine model:
+
+- the shared-memory message ring the boot log announces
+  (host 0: IN `0x0127f000`, OUT `0x0127f108`, four hosts);
+- its handshake on the word at `IN+0`, a three-state sequence `0 → 1 → 2 → 3`
+  driven by `FUN_000039b4` / `FUN_000039d8` and polled by the "Host msg" thread
+  (`FUN_00003cb0`);
+- the `0x634`-byte per-host control block at `0x59734`
+  (`+0x01` state, `+0x0C` → status word, `+0x10` → ack register);
+- delivery of message `0x41` (BFD application init), then `0x4a` (RX ring).
+
+Then BFD starts on its own, the driver thread runs under the real scheduler, and
+a frame arriving through `bcm56870-eth` is consumed by firmware code with
+nothing forced from outside. **This is what an end-to-end check requires.**
+
+**(B) Call the parser directly — legitimate but narrow.**
+Invoke `FUN_00004c48` → `FUN_0000b4e4` → `FUN_00008448` with a buffer in the
+layout the parser expects, and inspect the fields it fills. This does exercise
+real firmware code rather than a reimplementation, so it is a fair unit test of
+the parser. It does **not** demonstrate the end-to-end path, because it runs
+with the scheduler dead after a CPU hijack and says nothing about the driver
+thread or the ring handoff. It must not be reported as end-to-end.
+
+**(C) Build the ring ourselves and poke the poll — rejected.**
+That tests our own idea of the ring format rather than the firmware's. Circular.
+
+### The buffer layout, and an earlier mistake
+
+The frame does **not** start at the buffer base. From `FUN_00008448`:
+
+| offset | meaning |
+|---|---|
+| `buffer+0x18` bits[29:8] | frame length (**not** the descriptor field) |
+| `buffer+0x20` bits[18:7] | id; `0` means "parse as a normal frame" |
+| `buffer+0x40` | start of the Ethernet frame |
+
+The parser computes `puVar18 = (dma_addr + 0x40) - 0x1100000`, i.e. CPU
+`buffer+0x40`, so a 0x40-byte BCM header sits in front of the frame.
+
+An earlier revision of `harness/bfdtest.py` wrote the frame at offset `0` and
+put the length in the descriptor. The parser would have read garbage — which
+would explain a silent non-consumption **even with a correct ring**. That bug is
+fixed in the current script, but the end-to-end result is still not obtained.
+
+## Harness note: IRQs and single-routine calls
+
+`drive.py` masks IRQs by default. That keeps a single routine's return value
+stable, because otherwise the timer can preempt the call and the scheduler
+switches away before the result register is read.
+
+The side effect is that any *thread* the called routine creates is never
+scheduled — which made "did this routine start a worker?" look like NO for every
+test. Pass `--enable-irq` when the point of the call is to let the firmware's own
+threads run:
+
+```
+./drive.py --boot 8 --call 0x6f48 --enable-irq
+```
+
+**But be aware of the stronger limitation found later:** after a hijacked call
+returns, the CPU ends up IRQ-masked (`CPSR = 0x1f3`) with the timer pending, and
+a gdb `$cpsr` write does not stick. `--enable-irq` sets the mask on entry; it
+cannot guarantee it stays clear afterwards. Threads that only ever appear after
+a hijacked call should be assumed *not* to run. Driving the firmware through its
+own interfaces (the console, or the host queue) avoids this entirely.
+
 ## Testing routines directly
 
 Because the full boot depends on hardware we cannot model, individual routines
@@ -254,6 +467,11 @@ static analysis (Ghidra), not guessed:
 
 ## Known gaps
 
+- BFD never starts, because it is triggered by host queue messages that no host
+  sends (see above). Until that queue is modelled, injected frames cannot reach
+  a session.
+- The ethernet front-end writes frames into the ring but the firmware's
+  consumption of an injected frame is not yet demonstrated.
 - Only the interrupt sources listed above are driven. Non-timer interrupts that
   real hardware would raise (from the packet DMA, CMIC, link events) never fire,
   so code paths waiting on those do not run.

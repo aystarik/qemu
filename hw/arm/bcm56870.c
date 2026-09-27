@@ -37,7 +37,10 @@
 #include "hw/arm/boot.h"
 #include "hw/core/boards.h"
 #include "hw/char/serial-mm.h"
+#include "net/net.h"
+#include "net/eth.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/sysbus.h"
@@ -147,8 +150,16 @@ static const MemoryRegionOps chipid_ops = {
 static void chipid_realize(DeviceState *dev, Error **errp)
 {
     BCMChipIdState *s = BCM_CHIPID(dev);
+    /*
+     * Only a few bytes are the chip ID.  This used to claim a full 0x1000,
+     * which swallowed the strap/pinmux registers at 0x03241784..0x032417A0 and
+     * returned the chip-ID value 0xb870 for every read of them.  The firmware
+     * does read-modify-write on those registers (FUN_000039b4 sets a bit, then
+     * reads it back), so the bit never stuck and the host-message thread that
+     * arms interrupt enables there could not make progress.
+     */
     memory_region_init_io(&s->iomem, OBJECT(s), &chipid_ops, s,
-                          TYPE_BCM_CHIPID, 0x1000);
+                          TYPE_BCM_CHIPID, 0x100);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
 }
 
@@ -637,6 +648,472 @@ static const TypeInfo timer_info = {
     .class_init = timer_class_init,
 };
 
+/*
+ * ------------------------------------------------------------------
+ * Packet DMA engine at 0x03206400.
+ *
+ * Derived from pkt_dma_xfer() at 0x4938.  There are two identical descriptor
+ * banks 0x80 apart; a flag byte at 0x54FBC selects which one is live:
+ *
+ *   bank A (flag == 0)              bank B (flag != 0)
+ *     0x03206404  src_lo              0x03206484
+ *     0x03206408  src_hi              0x03206488
+ *     0x0320640C  dst_lo              0x0320648C
+ *     0x03206410  dst_hi              0x03206490
+ *     0x03206414  length in WORDS     0x03206494
+ *     0x03206418  control (start)     0x03206498
+ *     0x0320641C  status (polled)     0x0320649C
+ *
+ * Writing the control register starts a memory-to-memory copy of `length`
+ * 32-bit words; the status register then reads back non-zero.  bit 1 of the
+ * status means failure, and the caller turns that into a -1 return.
+ *
+ * Direction: register 0 (+0x00) is the SOURCE and register 1 (+0x08) is the
+ * DESTINATION.  bfd_msg_thread calls this as
+ *     pkt_dma_xfer(host_addr, 0, local_buf, 0, len, 2)
+ * and then reads the bytes out of local_buf, so the copy runs
+ * host_addr -> local_buf.
+ *
+ * This has to be a real transfer rather than an ignored register: the caller
+ * POLLS the status until (status & 3) != 0, so a RAZ/WI model would spin
+ * forever.  The addresses are DMA addresses, translated back to CPU ones with
+ * the same mapping the firmware applies on the way out (see dma_to_cpu()).
+ *
+ * That mapping is the reason the host-message path works: the host buffers sit
+ * at 0x1200000, which is identity-mapped, so the copy is a plain memcpy of
+ * guest RAM.
+ * ------------------------------------------------------------------
+ */
+#define TYPE_BCM_PKTDMA "bcm56870-pktdma"
+OBJECT_DECLARE_SIMPLE_TYPE(BCMPktDmaState, BCM_PKTDMA)
+
+/* Descriptor bank field offsets, relative to each bank's base. */
+#define DMA_SRC_LO   0x00
+#define DMA_SRC_HI   0x04
+#define DMA_DST_LO   0x08
+#define DMA_DST_HI   0x0c
+#define DMA_LEN      0x10
+#define DMA_CTRL     0x14
+#define DMA_STATUS   0x18
+
+/*
+ * Bank bases.  The firmware's register pointers are 0x03206404 and
+ * 0x03206484 (not ...00/...80), so the field offsets below are relative to
+ * those, giving:  +0x00 src_lo  +0x04 src_hi  +0x08 dst_lo  +0x0C dst_hi
+ *                 +0x10 length   +0x14 control  +0x18 status
+ */
+#define DMA_BANK_A   0x04
+#define DMA_BANK_B   0x84
+
+/* Which bank the flag byte at 0x54FBC selects. */
+#define DMA_BANK_FLAG_ADDR 0x00054FBC
+
+/* Address translation window (FUN_00000838). */
+#define DMA_WIN_BASE   0x01100000
+#define DMA_LOW_LIMIT  0x00040000      /* below this: offset 0        */
+#define DMA_MID_LIMIT  0x00100000      /* above this: identity        */
+#define DMA_MID_DELTA  0x00020000      /* 0x40000..0xFFFFF: -0x20000  */
+
+struct BCMPktDmaState {
+    SysBusDevice parent_obj;
+    MemoryRegion iomem;
+    uint32_t regs[0x100 / 4];
+    AddressSpace *as;
+};
+
+/*
+ * Convert a DMA address back into a CPU address.  The firmware maps CPU
+ * addresses INTO the DMA window on the way out; we invert it to find the
+ * buffer the descriptor refers to.
+ */
+static uint32_t dma_to_cpu(uint32_t dma)
+{
+    if (dma >= DMA_WIN_BASE && dma < DMA_WIN_BASE + DMA_LOW_LIMIT) {
+        return dma - DMA_WIN_BASE;
+    }
+    if (dma >= DMA_WIN_BASE + DMA_LOW_LIMIT &&
+        dma < DMA_WIN_BASE + DMA_MID_LIMIT) {
+        return dma - DMA_WIN_BASE + DMA_MID_DELTA;
+    }
+    return dma;                 /* identity: host buffers at 0x1200000 */
+}
+
+static void dma_do_transfer(BCMPktDmaState *s, hwaddr bank)
+{
+    uint32_t src = s->regs[(bank + DMA_SRC_LO) / 4];
+    uint32_t dst = s->regs[(bank + DMA_DST_LO) / 4];
+    uint32_t len = s->regs[(bank + DMA_LEN) / 4];
+    uint32_t cpu_src = dma_to_cpu(src);
+    uint32_t cpu_dst = dma_to_cpu(dst);
+    uint32_t bytes = len * 4;
+    g_autofree uint8_t *buf = NULL;
+
+    if (len == 0 || bytes > 64 * 1024 * 1024) {
+        s->regs[(bank + DMA_STATUS) / 4] = 2;   /* error */
+        return;
+    }
+
+    buf = g_malloc(bytes);
+    address_space_read(s->as, cpu_src, MEMTXATTRS_UNSPECIFIED, buf, bytes);
+    address_space_write(s->as, cpu_dst, MEMTXATTRS_UNSPECIFIED, buf, bytes);
+
+    s->regs[(bank + DMA_STATUS) / 4] = 1;       /* done, no error */
+}
+
+static uint64_t pktdma_read(void *opaque, hwaddr offset, unsigned size)
+{
+    BCMPktDmaState *s = BCM_PKTDMA(opaque);
+
+    if (offset + 4 > sizeof(s->regs)) {
+        return 0;
+    }
+    return s->regs[offset / 4];
+}
+
+static void pktdma_write(void *opaque, hwaddr offset, uint64_t value,
+                         unsigned size)
+{
+    BCMPktDmaState *s = BCM_PKTDMA(opaque);
+
+    if (offset + 4 > sizeof(s->regs)) {
+        return;
+    }
+    s->regs[offset / 4] = value;
+
+    /* Writing control kicks the transfer. */
+    if (offset == DMA_BANK_A + DMA_CTRL ||
+        offset == DMA_BANK_B + DMA_CTRL) {
+        dma_do_transfer(s, offset - DMA_CTRL);
+    }
+}
+
+static const MemoryRegionOps pktdma_ops = {
+    .read = pktdma_read,
+    .write = pktdma_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+static void pktdma_realize(DeviceState *dev, Error **errp)
+{
+    BCMPktDmaState *s = BCM_PKTDMA(dev);
+
+    s->as = &address_space_memory;
+    memory_region_init_io(&s->iomem, OBJECT(s), &pktdma_ops, s,
+                          TYPE_BCM_PKTDMA, 0x100);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+}
+
+static void pktdma_reset(DeviceState *dev)
+{
+    BCMPktDmaState *s = BCM_PKTDMA(dev);
+    memset(s->regs, 0, sizeof(s->regs));
+}
+
+static void pktdma_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->realize = pktdma_realize;
+    device_class_set_legacy_reset(dc, pktdma_reset);
+    dc->user_creatable = false;
+}
+
+static const TypeInfo pktdma_info = {
+    .name = TYPE_BCM_PKTDMA,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(BCMPktDmaState),
+    .class_init = pktdma_class_init,
+};
+
+/*
+ * ------------------------------------------------------------------
+ * Ethernet front-end for the packet DMA engine.
+ *
+ * The firmware does not talk to a MAC register block directly.  Instead it
+ * parks receive buffers in a descriptor ring and polls a "packet available"
+ * bitmap; for transmit it builds a descriptor and rings a doorbell.  So this
+ * device stands in for the MAC/DMA boundary:
+ *
+ *   RX   a frame arrives from the netdev.  We walk the channel's descriptor
+ *        ring, find a free slot, write the frame into its buffer, set the
+ *        length, and set the channel's bit in the ready bitmap (0x54FAC for
+ *        channel 0).  The firmware's poll (FUN_0000b58c) then picks it up and
+ *        hands it to its own ethernet parser.
+ *
+ *   TX   the firmware enqueues a descriptor and writes the doorbell.  We read
+ *        the buffer and hand it to the netdev.
+ *
+ * Ring geometry, verified against a running guest (FUN_0000b740):
+ *   channel block base 0x53328, stride 0xe40
+ *     +0x000  channel id
+ *     +0x004  descriptor ring base -- observed 0, see the note below
+ *     +0x00c  head/count
+ *   descriptor ring at 0x5B2E8, 64 entries of 16 bytes:
+ *     +0x00  DMA address of the buffer
+ *     +0x04  0
+ *     +0x08  low 16 bits = buffer length, high bits = control
+ *     +0x0c  owner/status
+ *
+ * NOTE ON THE RING BASE: the channel's +0x004 field reads back as 0 even
+ * though the ring lives at 0x5B2E8, so the base is NOT taken from there.  The
+ * firmware passes the ring address to FUN_00004b44 itself, and the ring the
+ * descriptors actually land in is the one FUN_0000b740 builds.  We therefore
+ * locate descriptors by following the DMA address held in the ready
+ * bookkeeping rather than trusting +0x004.  This is the least certain part of
+ * the model and is called out in the README.
+ * ------------------------------------------------------------------
+ */
+#define TYPE_BCM_ETH "bcm56870-eth"
+OBJECT_DECLARE_SIMPLE_TYPE(BCMEthState, BCM_ETH)
+
+/*
+ * Channel state, stride 0x18, base DAT_00004cb0 (0x5B03C).  The firmware uses
+ * channel index 0xFF for the BFD receive path, so the block is at
+ *     0x5B03C + 0xFF * 0x18 = 0x5C824
+ * and the fields, read off FUN_00004b44 (enqueue) and FUN_00004c48 (dequeue):
+ *
+ *   +0x04  descriptor ring base            (observed 0x0005B2E8)
+ *   +0x08  ring size in entries            (observed 0x80 = 128)
+ *   +0x0C  enqueue limit                   (observed 0x40 = 64 buffers given)
+ *   +0x10  producer, advanced by enqueue
+ *   +0x14  consumer, advanced by dequeue
+ *
+ * A descriptor is 16 bytes:
+ *   +0x00  DMA address of the receive buffer
+ *   +0x04  0
+ *   +0x08  low 16 bits = frame length, high bits = control
+ *   +0x0C  owner/status; BIT 31 SET means "the DMA engine has filled this"
+ *
+ * FUN_00004c48 dequeues by reading the descriptor at the consumer index and
+ * testing bit 31 of +0x0C.  So handing a received frame to the firmware is:
+ *   write the bytes into the descriptor's buffer, store the length, then set
+ *   bit 31 of +0x0C.  The firmware's own driver thread (FUN_0000b5b0) does the
+ *   dequeue and passes the descriptor to its ethernet parser.
+ *
+ * NOTE ON AN EARLIER MISTAKE: an initial version of this device raised bit 0 of
+ * 0x54FAC as a "packet available" flag.  That word is an initialisation flag
+ * which reads 1 permanently, not a receive interrupt, so injected frames were
+ * never collected.  The owner bit above is the real handoff.
+ */
+#define ETH_CHAN_IDX         0xFF
+#define ETH_CHAN_BASE        0x0005B03C
+#define ETH_CHAN_STRIDE      0x18
+#define ETH_CHAN_STATE       (ETH_CHAN_BASE + ETH_CHAN_IDX * ETH_CHAN_STRIDE)
+
+#define ETH_CH_DESC_RING     0x04
+#define ETH_CH_RING_SIZE     0x08
+#define ETH_CH_PRODUCER      0x10
+#define ETH_CH_CONSUMER      0x14
+
+#define ETH_DESC_SIZE        16
+#define ETH_DESC_DMA_ADDR    0x00
+#define ETH_DESC_LEN         0x08
+#define ETH_DESC_STATUS      0x0c
+#define ETH_DESC_OWNER       0x80000000u   /* set by the engine when filled */
+
+#define ETH_MAX_FRAME        0x120
+
+struct BCMEthState {
+    SysBusDevice parent_obj;
+    NICState *nic;
+    NICConf conf;
+    AddressSpace *as;
+};
+
+static uint32_t eth_dma_to_cpu(uint32_t dma)
+{
+    if (dma >= 0x01100000 && dma < 0x01140000) {
+        return dma - 0x01100000;
+    }
+    if (dma >= 0x01140000 && dma < 0x01200000) {
+        return dma - 0x010E0000;
+    }
+    return dma;              /* identity, e.g. the host buffers at 0x1200000 */
+}
+
+static uint32_t eth_rd32(BCMEthState *s, uint32_t addr)
+{
+    uint8_t b[4];
+    address_space_read(s->as, addr, MEMTXATTRS_UNSPECIFIED, b, 4);
+    return ldl_le_p(b);
+}
+
+static void eth_wr32(BCMEthState *s, uint32_t addr, uint32_t v)
+{
+    uint8_t b[4];
+    stl_le_p(b, v);
+    address_space_write(s->as, addr, MEMTXATTRS_UNSPECIFIED, b, 4);
+}
+
+/* Deliver one frame into the firmware's receive ring. */
+static void eth_rx_frame(BCMEthState *s, const uint8_t *buf, size_t len)
+{
+    uint32_t ring, size, cons, desc, dma_buf, ctl;
+
+    if (len > ETH_MAX_FRAME) {
+        return;
+    }
+
+    ring = eth_rd32(s, ETH_CHAN_STATE + ETH_CH_DESC_RING);
+    size = eth_rd32(s, ETH_CHAN_STATE + ETH_CH_RING_SIZE);
+    cons = eth_rd32(s, ETH_CHAN_STATE + ETH_CH_CONSUMER);
+
+    /* The ring is only set up once the firmware has started its RX driver. */
+    if (ring == 0 || size == 0) {
+        return;
+    }
+    cons %= size;
+
+    desc = ring + cons * ETH_DESC_SIZE;
+    dma_buf = eth_rd32(s, desc + ETH_DESC_DMA_ADDR);
+    if (dma_buf == 0) {
+        return;
+    }
+
+    address_space_write(s->as, eth_dma_to_cpu(dma_buf),
+                        MEMTXATTRS_UNSPECIFIED, buf, len);
+
+    ctl = eth_rd32(s, desc + ETH_DESC_LEN);
+    ctl = (ctl & 0xffff0000u) | (uint16_t)len;
+    eth_wr32(s, desc + ETH_DESC_LEN, ctl);
+
+    /* Hand ownership to the firmware: bit 31 says "filled by the engine". */
+    eth_wr32(s, desc + ETH_DESC_STATUS, ETH_DESC_OWNER);
+
+    /*
+     * Do NOT advance the producer: that side belongs to the firmware, which
+     * advances it when it queues empty buffers.  The driver's dequeue moves
+     * the consumer forward itself.
+     */
+}
+
+static bool eth_can_receive(NetClientState *nc)
+{
+    return true;
+}
+
+static ssize_t eth_receive(NetClientState *nc, const uint8_t *buf, size_t size)
+{
+    BCMEthState *s = qemu_get_nic_opaque(nc);
+
+    eth_rx_frame(s, buf, size);
+    return size;
+}
+
+static void eth_cleanup(NetClientState *nc)
+{
+}
+
+static const NetClientInfo eth_net_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .can_receive = eth_can_receive,
+    .receive = eth_receive,
+    .cleanup = eth_cleanup,
+};
+
+static void eth_realize(DeviceState *dev, Error **errp)
+{
+    BCMEthState *s = BCM_ETH(dev);
+
+    s->as = &address_space_memory;
+
+
+    if (!qemu_configure_nic_device(dev, true, NULL)) {
+        /*
+         * Running without -netdev is perfectly fine: the rest of the machine
+         * (console, scheduler, timers) still works, there is simply no
+         * ethernet.  Do not make that a hard error.
+         */
+        return;
+    }
+
+    qemu_macaddr_default_if_unset(&s->conf.macaddr);
+    s->nic = qemu_new_nic(&eth_net_info, &s->conf,
+                          object_get_typename(OBJECT(dev)), dev->id,
+                          &dev->mem_reentrancy_guard, s);
+    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+}
+
+/*
+ * QEMU 11.x terminates property arrays with the closing brace; there is no
+ * DEFINE_PROP_END_OF_LIST() sentinel.
+ */
+static const Property eth_props[] = {
+    DEFINE_NIC_PROPERTIES(BCMEthState, conf),
+};
+
+static void eth_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->realize = eth_realize;
+    device_class_set_props(dc, eth_props);
+    /*
+     * Left user-creatable so it can be attached explicitly with
+     * -device bcm56870-eth,netdev=... ; the machine also creates one
+     * automatically when a netdev is configured.
+     */
+}
+
+static const TypeInfo eth_info = {
+    .name = TYPE_BCM_ETH,
+    .parent = TYPE_DEVICE,
+    .instance_size = sizeof(BCMEthState),
+    .class_init = eth_class_init,
+};
+
+/*
+ * ------------------------------------------------------------------
+ * Strap / pinmux scratch registers at 0x03241784.
+ *
+ * The firmware treats these as plain read-modify-write bits: FUN_000039b4
+ * ORs bit 0 and FUN_000039d8 clears bits, then re-reads.  They therefore need
+ * backing storage.  If they are left RAZ/WI the read-back is always 0, the bit
+ * the firmware just set vanishes, and the host-message thread that arms its
+ * interrupt enables here never makes progress.
+ *
+ * No behaviour is inferred from the values; they are only retained.
+ * ------------------------------------------------------------------
+ */
+static uint64_t strap_read(void *opaque, hwaddr offset, unsigned size)
+{
+    static const uint8_t zero[4];
+    const uint8_t *base = opaque ? (const uint8_t *)opaque : zero;
+
+    if (offset + size > 0x7c) {
+        return 0;
+    }
+    switch (size) {
+    case 1: return base[offset];
+    case 2: return lduw_le_p(base + offset);
+    default: return ldl_le_p(base + offset);
+    }
+}
+
+static void strap_write(void *opaque, hwaddr offset, uint64_t value,
+                        unsigned size)
+{
+    uint8_t *base = opaque;
+
+    if (!base || offset + size > 0x7c) {
+        return;
+    }
+    switch (size) {
+    case 1: base[offset] = value; break;
+    case 2: stw_le_p(base + offset, value); break;
+    default: stl_le_p(base + offset, value); break;
+    }
+}
+
+static const MemoryRegionOps strap_ops = {
+    .read = strap_read,
+    .write = strap_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 /* ------------------------------------------------------------------ */
 /* The machine                                                        */
 /* ------------------------------------------------------------------ */
@@ -650,6 +1127,8 @@ struct BCM56870State {
 
     BCMIntcState *intc;
     BCMTimerState *timer;
+    MemoryRegion strap_iomem;
+    uint8_t strap[0x7c];
     SerialMM *uart0;
     SerialMM *uart1;
     SerialMM *uart2;
@@ -739,11 +1218,29 @@ static void bcm56870_init(MachineState *machine)
                                                      BCM_UART1_IRQ),
                               1843200, serial_hd(1), DEVICE_LITTLE_ENDIAN);
 
+    /* --- Ethernet front-end for the DMA rings --------------------- */
+    dev = qdev_new(TYPE_BCM_ETH);
+    qdev_realize_and_unref(dev, NULL, &error_fatal);
+
+    /* --- Packet DMA engine ---------------------------------------- */
+    dev = qdev_new(TYPE_BCM_PKTDMA);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x03206400);
+
     /* --- Mark remaining device windows as unimplemented ----------- */
     create_unimplemented_device("bcm56870.pktdma", 0x03205000, 0x1000);
     create_unimplemented_device("bcm56870.pktdma-desc", 0x03206400, 0x100);
     create_unimplemented_device("bcm56870.intc-status", 0x03235000, 0x100);
-    create_unimplemented_device("bcm56870.pinmux", 0x03241700, 0x100);
+    /*
+     * Strap/pinmux scratch.  The firmware uses these as ordinary
+     * read-modify-write bits (FUN_000039b4 ORs bit 0, FUN_000039d8 clears
+     * bits), so they need BACKING STORAGE: with RAZ/WI the read-back returns 0
+     * and the bit the firmware just set disappears, which stalls the
+     * host-message thread.  Nothing here is interpreted; it is only state.
+     */
+    memory_region_init_io(&s->strap_iomem, OBJECT(machine), &strap_ops,
+                          s->strap, "bcm56870.strap", sizeof(s->strap));
+    memory_region_add_subregion(sysmem, 0x03241784, &s->strap_iomem);
     create_unimplemented_device("bcm56870.cmic", 0x00030300, 0x100);
     /*
      * --- Fallback console UART at 0x00084000 ------------------------
@@ -860,6 +1357,8 @@ static void bcm56870_register_types(void)
     type_register_static(&chipid_info);
     type_register_static(&intc_info);
     type_register_static(&timer_info);
+    type_register_static(&pktdma_info);
+    type_register_static(&eth_info);
     type_register_static(&bcm56870_machine_type);
 }
 

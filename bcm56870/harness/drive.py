@@ -90,6 +90,10 @@ def main():
     ap.add_argument("--regs", action="store_true")
     ap.add_argument("--arm", action="store_true",
                     help="call in ARM state (default is Thumb)")
+    ap.add_argument("--enable-irq", action="store_true",
+                    help="leave IRQs enabled so any thread the called routine "
+                         "creates can actually be scheduled (default masks "
+                         "them, which keeps single-routine results stable)")
     a = ap.parse_args()
 
     m = Machine()
@@ -113,7 +117,22 @@ def main():
             # is Thumb.  Getting T wrong makes the CPU decode garbage and
             # prefetch-abort to vector 0xC, so default to Thumb and allow
             # --arm for the handful of ARM routines.
-            cpsr = "0x1d3" if a.arm else "0x1f3"   # SVC, T bit, IRQ+FIQ masked
+            # SVC mode with the T bit set (Thumb):
+            #   0x1f3 = SVC | T | F | I   (IRQs masked)  <- default
+            #   0x173 = SVC | T | F       (IRQs enabled) <- --enable-irq
+            #
+            # The default masks IRQs so the timer cannot preempt the call and
+            # clobber the result registers before we read them; without this,
+            # routines that return a value (strlen, memcmp) intermittently
+            # report garbage because the scheduler switched away mid-call.
+            #
+            # But masking IRQs also means any THREAD the routine creates is
+            # never scheduled, so "did it start a worker?" always looked like
+            # NO.  Pass --enable-irq when the point of the call is to let the
+            # firmware's own threads run.
+            cpsr = "0x1d3" if a.arm else "0x1f3"
+            if a.enable_irq:
+                cpsr = "0x153" if a.arm else "0x173"
             # Plant a Thumb "b ." park loop at the return address so the
             # called routine returns into a harmless spin instead of executing
             # whatever happens to be at 0x0.
