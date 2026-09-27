@@ -22,9 +22,34 @@ msg host 2 in 0x0127f108 out 0x0127f108
 msg host 3 in 0x0127f210 out 0x0127f18c
 Board initialization complete
 =>
+help
+Help:
+	       bfd	BFD unit tests
+	     board	Board specific commands
+	     cache	Cache control
+	   history	history
+	      help	list commands
+	         ?	list commands
+	  loglevel	Enable tracing. Valid values are error|warn|info|debug0|debug1
+	    memory	[test|report|read|write|dump|bench]
+	       mpu	MPU display
+	        ps	list threads
+	      rupt	rupt commands
+	     stack	stack usage report
+	     stats	[show|reset] - statistics control
+	   version	version info
+
+ps
+ID         Name       Priority State  lock SchedCnt         run_time   %
+0x00058c7c Idle              0     2     1        1    1385999998383  99
+0x0007ff68 board init       15     3     3        4               -2  13261498
+0x0007eec8 cmicx_uart slih  11     1     3        2       2000000000   0
+0x0007ea30 Host msg         10     2     4        1       1000000000   0
+0x0007e5b0 System msg        6     1     2        1                0   0
 ```
 
-Achieved with **zero exceptions** and **zero unassigned-memory accesses**.
+Achieved with **zero data aborts** and **zero unassigned-memory accesses**, and
+the CLI is fully interactive (interrupts are delivered).
 
 ## Layout
 
@@ -93,8 +118,10 @@ Exit with `Ctrl-A x`.
 |---|---|---|
 | `0x00000000` | 512 KiB | Low RAM: ITCM + gap + DTCM, flat |
 | `0x01200000` | 1 MiB | System heap / message buffers |
-| `0x00080000` | 4 KiB | Interrupt controller (ignored) |
-| `0x00082000` | 4 KiB | System timer (ignored) |
+| `0x00080000` | 4 KiB | Interrupt controller (modelled) |
+| `0x00082000` | 4 KiB | System timer, IRQ 8 (modelled) |
+| `0x18320000` | 4 KiB | IRQ enable/pending bitmap bank A |
+| `0x18330000` | 4 KiB | IRQ enable/pending bitmap bank B |
 | `0x03220000` | — | 16550 UART 0 |
 | `0x03221000` | — | 16550 UART 1 |
 | `0x00084000` | — | 16550 UART 2 — **the console** |
@@ -116,32 +143,64 @@ This is a local experiment and is **not** proposed for upstream merge.
 - The `cortex-r5` CPU (QEMU's existing model).
 - The memory map above, byte-exact against the image.
 - Real 16550 UARTs with a 4-byte register stride (`regshift = 2`), so `LSR`
-  sits at `+0x14` where the firmware polls it.
+  sits at `+0x14` where the firmware polls it, wired to their interrupt lines.
 - The chip-ID register.
+- The interrupt controller and the system timer, to the extent the firmware
+  actually uses them (see below).
 
-**What is deliberately NOT modelled: every peripheral whose semantics we do not
-know.** All such MMIO windows — the interrupt controller at `0x00080000`, the
-system timer at `0x00082000`, the IRQ enable/pending bitmap banks at
-`0x18320000`/`0x18330000`, the packet DMA, CMIC, strap/pinmux and others — are
-**ignored (RAZ/WI)**: reads return 0, writes have no effect, and nothing raises
-an interrupt.
+**Interrupts are modelled**, because the firmware's own operation depends on
+them: without them the console's receive ISR never fills the ring buffer that
+`console_getc()` reads, so the CLI cannot accept input at all.
 
-This is a deliberate choice. An earlier revision synthesised a timer tick and an
-interrupt controller so the scheduler would keep running. That produced a guest
-that looked busier but was behaving differently from the real device, which
-makes any conclusion drawn from a run unsound: the scheduler was being driven by
-emulator-invented events rather than by hardware. Ignoring unknown MMIO is the
-honest option — the guest sees "device present but inert", and nothing is
-fabricated.
+Peripherals whose semantics we *cannot* determine are still ignored (RAZ/WI) —
+the packet DMA, CMIC, strap/pinmux and the second DMA engine. Nothing is
+invented for those.
 
-**Consequences.** Because no interrupts are delivered, paths that depend on them
-do not progress:
-- The CLI reads from a software ring buffer filled by a console ISR, so **typed
-  commands are not consumed**; the `=>` prompt appears and the machine idles
-  there.
-- Tick-driven scheduler preemption does not advance.
+### Interrupt architecture
 
-The boot messages above do not depend on interrupts, so they appear normally.
+Recovered from the firmware, not assumed:
+
+| Line | Device | Handler |
+|---|---|---|
+| 8 | timer `0x00082000` | `0x6B1` → scheduler tick |
+| 9 | timer alias `0x00082020` | `0x3799` |
+| 16 | console UART `0x00084000` | `FUN_00003278` (RX/TX ISR) |
+| 40 | UART0 `0x03220000` | registered by the UART setup |
+| 41 | UART1 `0x03221000` | registered by the UART setup |
+
+The controller at `0x00080000` is **not a stock ARM GIC**, and it is worth
+recording why, since reaching for QEMU's `arm_gic` is the obvious move:
+
+- the current IRQ is read from `INTC+0xF00`; a GIC returns it from `GICC_IAR`
+  and has no register there;
+- it is acknowledged by **writing zero to `INTC+0xF00`**; a GIC uses `GICC_EOIR`;
+- the enable/pending bitmaps live in a **separate window** at `0x18320090` /
+  `0x183200B0`, not inside the controller's own 0x1000 block where a GIC would
+  put `GICD_ISPENDR` at `dist+0x200`.
+
+`irq_dispatch()` reads `+0xF00`, rounds down to a group of eight, scans that
+group in the two bitmap windows to find the line, calls
+`handler_table[irq]` (0x38-byte descriptors at `0x54FD8`), writes
+`1 << (irq/8 & 31)` to `+0x14`, then clears `+0xF00` to acknowledge.
+
+Two details that were easy to get wrong:
+- the bitmaps are **arrays of words indexed by `irq/32`**, so the dispatcher
+  walks `base+0, base+4, … base+0x1C`. Treating the offsets as single registers
+  makes every scan read past the end and find nothing.
+- the controller must **latch** an incoming request independently of how long
+  the peripheral holds the line, and the acknowledge must release the device
+  input. Otherwise the acknowledge is undone by the still-asserted input and the
+  CPU re-enters the vector forever.
+
+### Timer rate caveat
+
+The tick period is 10 ms of virtual time, chosen so the guest makes visible
+progress; the real part's clock rate is not known, so **timing values reported
+by the guest are not meaningful in absolute terms.** The `ps` output, for
+example, shows the idle thread with an implausible `run_time` and 99% — the
+counter advances (13.9e12 → 23.8e12 over 10 s of wall time, so the plumbing is
+correct) but the scale does not correspond to real hardware. Treat these as
+"the mechanism works", not as measurements.
 
 ## Testing routines directly
 
@@ -195,10 +254,12 @@ static analysis (Ghidra), not guessed:
 
 ## Known gaps
 
-- No interrupt delivery (see above), so CLI input and tick-driven preemption do
-  not work.
+- Only the interrupt sources listed above are driven. Non-timer interrupts that
+  real hardware would raise (from the packet DMA, CMIC, link events) never fire,
+  so code paths waiting on those do not run.
 - The packet DMA, CMIC and other peripherals are inert, so networking and the
   BFD packet path cannot be exercised.
+- Timer/uptime values are not calibrated to real hardware (see the caveat above).
 - Single CPU only.
 - The 128 KiB hole at `0x20000..0x3FFFF` is backed by RAM here for load
   simplicity, though architecturally it is unbacked.

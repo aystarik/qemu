@@ -75,6 +75,20 @@
 #define BCM_UART0_BASE  0x03220000
 #define BCM_UART1_BASE  0x03221000
 
+#define BCM_CONSOLE_BASE 0x00084000
+
+/*
+ * Interrupt lines, as the firmware itself registers them:
+ *   IRQ 8  scheduler tick, from the timer at 0x00082000
+ *   IRQ 16 console UART at 0x00084000  (device type 0)
+ *   IRQ 40 UART0 at 0x03220000         (device type 1)
+ *   IRQ 41 UART1 at 0x03221000         (device type 2)
+ * (IRQ 9 is also installed by board_init_thread for the 0x82020 alias.)
+ */
+#define BCM_UART0_IRQ   40
+#define BCM_UART1_IRQ   41
+#define BCM_CONSOLE_IRQ 16
+
 #define BCM_INTC_BASE   0x00080000
 #define BCM_INTC_SIZE   0x00001000
 
@@ -161,37 +175,156 @@ static const TypeInfo chipid_info = {
 
 /*
  * ------------------------------------------------------------------
- * Interrupt controller at 0x00080000.
+ * Interrupt controller: control block at 0x00080000, and the two
+ * enable/pending bitmap windows at 0x18320000 and 0x18330000.
  *
- * This is hardware we cannot model.  The firmware's accesses are IGNORED
- * (RAZ/WI): reads return 0, writes have no effect, and the block is NOT
- * wired to the CPU's IRQ line.  No interrupts are ever delivered.
+ * NOT a stock ARM GIC.  Reaching for QEMU's arm_gic model is the obvious move
+ * and it does not fit, so the differences are worth recording:
  *
- * That is intentional.  Inventing an interrupt controller would fabricate
- * scheduler activity the real machine gets from real hardware, making the
- * guest's behaviour unrepresentative of the actual device.  The CPU, memory
- * map and UARTs are what this model is for; the guest's own bring-up is
- * exercised by calling its initialisation routines directly instead (see
- * emu/harness/).
+ *   * the current IRQ is read from INTC+0xF00; a GIC returns it from GICC_IAR
+ *     at cpu+0x00C, and has no register at +0xF00;
+ *   * it is acknowledged by WRITING ZERO to INTC+0xF00; a GIC uses EOIR at
+ *     cpu+0x010;
+ *   * the bitmaps the dispatcher scans are in a SEPARATE address window
+ *     (0x18320090 / 0x183200B0) rather than inside the controller's own 0x1000
+ *     block, where a GIC would put GICD_ISPENDR at dist+0x200.
+ *
+ * irq_dispatch() does the following, and only this much is modelled:
+ *
+ *   n    = read INTC+0xF00            (0 when no interrupt)
+ *   g    = n & ~7                     (round down to a group of eight)
+ *   scan bits g..g+7 of 0x18320x_B0   -> irq, else
+ *   scan bits g..g+7 of 0x18320x_90   -> irq
+ *   if irq: call handler table[irq]   (0x38-byte descriptors at 0x54FD8)
+ *           write INTC+0x14 = 1 << (irq/8 & 31)
+ *   write INTC+0xF00 = 0              (acknowledge)
+ *
+ * The bank selector is a flag byte at 0x54FBC (0 -> bank at 0x1832_xxxx).
+ *
+ * Devices assert individual lines through the "src" GPIO array.  Pending
+ * state is kept here and mirrored into the pending register of the active
+ * bank, so the dispatcher's scan sees exactly what real hardware would show.
+ * The CPU IRQ line is asserted while any source is pending and released when
+ * the acknowledge clears the last one.
  * ------------------------------------------------------------------
  */
 #define TYPE_BCM_INTC "bcm56870-intc"
 OBJECT_DECLARE_SIMPLE_TYPE(BCMIntcState, BCM_INTC)
 
+#define BCM_INTC_NUM_IRQ   256
+#define BCM_INTC_NUM_REGS  (BCM_INTC_SIZE / 4)
+#define BCM_INTC_BM_WORDS  8            /* 8 words x 32 bits = 256 sources */
+
+/* Register offsets inside a bitmap window. */
+#define BM_PENDING_OFF  0xb0
+#define BM_ENABLE_OFF   0x90
+
 struct BCMIntcState {
     SysBusDevice parent_obj;
-    MemoryRegion iomem;
+
+    MemoryRegion iomem;      /* control block, 0x00080000 */
+    MemoryRegion bm0;        /* bitmap window, 0x18320000 */
+    MemoryRegion bm1;        /* bitmap window, 0x18330000 */
+
+    qemu_irq irq_out;        /* to the CPU IRQ line */
+
+    uint32_t regs[BCM_INTC_NUM_REGS];
+
+    /*
+     * Which device inputs are currently asserted, and the latched pending
+     * state the dispatcher reads.  These are separate on purpose: a real
+     * interrupt controller latches an incoming request and keeps it until the
+     * CPU acknowledges, independently of how long the peripheral holds the
+     * line.  Without that separation an acknowledge would be undone
+     * immediately by the still-asserted input.
+     */
+    DECLARE_BITMAP(input_high, BCM_INTC_NUM_IRQ);
+
+    /* What the dispatcher will read back. */
+    uint32_t pending_bm[BCM_INTC_BM_WORDS];
+    uint32_t enable_bm[BCM_INTC_BM_WORDS];
+    uint32_t alt_pending_bm[BCM_INTC_BM_WORDS];
+    uint32_t alt_enable_bm[BCM_INTC_BM_WORDS];
+
+    /* Which bank the firmware selected (flag byte at 0x54FBC). */
+    bool bank_b;
 };
+
+static int intc_lowest_pending(BCMIntcState *s)
+{
+    for (int w = 0; w < BCM_INTC_BM_WORDS; w++) {
+        uint32_t v = s->pending_bm[w];
+        if (v) {
+            return w * 32 + ctz32(v);
+        }
+    }
+    return -1;
+}
+
+static void intc_refresh(BCMIntcState *s)
+{
+    if (intc_lowest_pending(s) >= 0) {
+        qemu_irq_raise(s->irq_out);
+    } else {
+        qemu_irq_lower(s->irq_out);
+    }
+}
+
+static void intc_set_irq(void *opaque, int irq, int level)
+{
+    BCMIntcState *s = BCM_INTC(opaque);
+    int w, b;
+
+    if (irq < 0 || irq >= BCM_INTC_NUM_IRQ) {
+        return;
+    }
+    w = irq / 32;
+    b = 1u << (irq % 32);
+
+    if (level) {
+        s->pending_bm[w] |= b;
+    } else {
+        s->pending_bm[w] &= ~b;
+    }
+    intc_refresh(s);
+}
+
+/* ---------------- control block (0x00080000) ---------------- */
 
 static uint64_t intc_read(void *opaque, hwaddr offset, unsigned size)
 {
-    return 0;
+    BCMIntcState *s = BCM_INTC(opaque);
+    unsigned idx = offset >> 2;
+
+    if (offset == 0xf00) {
+        int irq = intc_lowest_pending(s);
+        return irq < 0 ? 0 : (uint32_t)irq;
+    }
+    if (idx >= BCM_INTC_NUM_REGS) {
+        return 0;
+    }
+    return s->regs[idx];
 }
 
 static void intc_write(void *opaque, hwaddr offset, uint64_t value,
                        unsigned size)
 {
-    /* ignored */
+    BCMIntcState *s = BCM_INTC(opaque);
+    unsigned idx = offset >> 2;
+
+    if (offset == 0xf00) {
+        /* Acknowledge: retire the source the dispatcher just serviced. */
+        int irq = intc_lowest_pending(s);
+        if (irq >= 0) {
+            s->pending_bm[irq / 32] &= ~(1u << (irq % 32));
+        }
+        intc_refresh(s);
+        return;
+    }
+    if (idx >= BCM_INTC_NUM_REGS) {
+        return;
+    }
+    s->regs[idx] = value;
 }
 
 static const MemoryRegionOps intc_ops = {
@@ -199,21 +332,133 @@ static const MemoryRegionOps intc_ops = {
     .write = intc_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
-    .impl = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+/* ---------------- bitmap windows ---------------- */
+
+static uint32_t *bm_enable(BCMIntcState *s, bool alt)
+{
+    return alt ? s->alt_enable_bm : s->enable_bm;
+}
+
+static uint32_t *bm_pending(BCMIntcState *s, bool alt)
+{
+    return alt ? s->alt_pending_bm : s->pending_bm;
+}
+
+static uint64_t bm_read(void *opaque, hwaddr offset, unsigned size, bool alt)
+{
+    BCMIntcState *s = BCM_INTC(opaque);
+
+    /*
+     * These are ARRAYS of 32-bit words, indexed by (irq / 32), not single
+     * registers: the dispatcher does "ldr rX, [base, word, lsl #2]" with
+     * word = (vector / 8) / 32, so it walks base+0, base+4, ... base+0x1C.
+     * Treating the offsets as one word each makes every scan read past the
+     * end and return 0, and the dispatcher then finds no interrupt at all.
+     */
+    if (offset >= BM_ENABLE_OFF && offset < BM_ENABLE_OFF + BCM_INTC_BM_WORDS * 4) {
+        return bm_enable(s, alt)[(offset - BM_ENABLE_OFF) / 4];
+    }
+    if (offset >= BM_PENDING_OFF && offset < BM_PENDING_OFF + BCM_INTC_BM_WORDS * 4) {
+        return bm_pending(s, alt)[(offset - BM_PENDING_OFF) / 4];
+    }
+    return 0;
+}
+
+static void bm_write(void *opaque, hwaddr offset, uint64_t value, unsigned size,
+                     bool alt)
+{
+    BCMIntcState *s = BCM_INTC(opaque);
+
+    /*
+     * The firmware sets enable bits here (board_init_thread ORs 0x100 for
+     * IRQ 8, the UART setup ORs in its own line).  Keep them: they are what
+     * irq_dispatch falls back to when it finds no pending bit.
+     */
+    if (offset >= BM_ENABLE_OFF && offset < BM_ENABLE_OFF + BCM_INTC_BM_WORDS * 4) {
+        bm_enable(s, alt)[(offset - BM_ENABLE_OFF) / 4] = value;
+        return;
+    }
+    if (offset >= BM_PENDING_OFF && offset < BM_PENDING_OFF + BCM_INTC_BM_WORDS * 4) {
+        bm_pending(s, alt)[(offset - BM_PENDING_OFF) / 4] = value;
+        return;
+    }
+}
+
+static uint64_t bm0_read(void *o, hwaddr off, unsigned sz)
+{
+    return bm_read(o, off, sz, false);
+}
+static void bm0_write(void *o, hwaddr off, uint64_t v, unsigned sz)
+{
+    bm_write(o, off, v, sz, false);
+}
+static uint64_t bm1_read(void *o, hwaddr off, unsigned sz)
+{
+    return bm_read(o, off, sz, true);
+}
+static void bm1_write(void *o, hwaddr off, uint64_t v, unsigned sz)
+{
+    bm_write(o, off, v, sz, true);
+}
+
+static const MemoryRegionOps bm0_ops = {
+    .read = bm0_read, .write = bm0_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+static const MemoryRegionOps bm1_ops = {
+    .read = bm1_read, .write = bm1_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
 static void intc_realize(DeviceState *dev, Error **errp)
 {
     BCMIntcState *s = BCM_INTC(dev);
+
+    /* mmio[0]: control block */
     memory_region_init_io(&s->iomem, OBJECT(s), &intc_ops, s,
-                          TYPE_BCM_INTC, BCM_INTC_SIZE);
+                          TYPE_BCM_INTC ".ctrl", BCM_INTC_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+
+    /* mmio[1], mmio[2]: the two bitmap windows */
+    memory_region_init_io(&s->bm0, OBJECT(s), &bm0_ops, s,
+                          TYPE_BCM_INTC ".bm0", 0x1000);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->bm0);
+
+    memory_region_init_io(&s->bm1, OBJECT(s), &bm1_ops, s,
+                          TYPE_BCM_INTC ".bm1", 0x1000);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->bm1);
+
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq_out);
+    qdev_init_gpio_in_named(dev, intc_set_irq, "src", BCM_INTC_NUM_IRQ);
+}
+
+static void intc_reset(DeviceState *dev)
+{
+    BCMIntcState *s = BCM_INTC(dev);
+
+    memset(s->regs, 0, sizeof(s->regs));
+    bitmap_zero(s->input_high, BCM_INTC_NUM_IRQ);
+    memset(s->pending_bm, 0, sizeof(s->pending_bm));
+    memset(s->enable_bm, 0, sizeof(s->enable_bm));
+    memset(s->alt_pending_bm, 0, sizeof(s->alt_pending_bm));
+    memset(s->alt_enable_bm, 0, sizeof(s->alt_enable_bm));
+    s->bank_b = false;
+    s->regs[0x14 / 4] = 0xffffffff;
+    intc_refresh(s);
 }
 
 static void intc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = intc_realize;
+    device_class_set_legacy_reset(dc, intc_reset);
     dc->user_creatable = false;
 }
 
@@ -226,39 +471,123 @@ static const TypeInfo intc_info = {
 
 /*
  * ------------------------------------------------------------------
- * Timer block at 0x00082000 / 0x00082020, and the interrupt enable/pending
- * bitmap banks at 0x18320000 / 0x18330000.
+ * Timer block at 0x00082000 (aliased at 0x00082020).
  *
- * All of these are hardware we cannot model, so every access is IGNORED
- * (RAZ/WI): reads return 0 and writes have no effect.  In particular this
- * block raises no interrupts.
+ * Register behaviour, read off FUN_00003700 (which programs it) and
+ * mos_uptime_ticks() (which reads it), and confirmed against the running
+ * guest:
  *
- * That is deliberate.  Synthesising a tick or a fake interrupt controller
- * would fabricate scheduler activity that the real machine obtains from real
- * hardware, so the guest would behave differently from the actual device and
- * any conclusion drawn from the run would be unsound.  The purpose of this
- * model is the CPU, the memory map and the UARTs; the guest's own bring-up
- * is exercised by calling its initialisation routines directly under a
- * harness (see emu/harness/).
+ *   +0x00 = 0x331E70A5   magic signature written by the firmware
+ *   +0x04 = free-running counter.  The firmware seeds it with 1 during
+ *                        bring-up, then mos_uptime_ticks() reads it (twice,
+ *                        to detect a concurrent update) and scales it into
+ *                        microseconds.
+ *   +0x08 = mode byte (0x62 then 0xE2)
+ *   +0x0C = control (written 1)
+ *   +0x10 = period value
+ *
+ * The scheduler is driven by this block.  board_init_thread installs the tick
+ * on IRQ 8: it ORs 0x100 (bit 8) into the enable bitmap and stores handler
+ * 0x6B1 into descriptor 8 of the 0x38-byte handler table.  The handler stub at
+ * 0x6B0 calls 0x198c, which is the scheduler tick.
+ *
+ * So the timer asserts line 8 periodically, and that is what makes the guest's
+ * own scheduler advance.
+ *
+ * The period is deliberately coarse.  The guest spends a long time in device
+ * initialisation threads, and a fast tick makes the scheduler reschedule
+ * constantly so far less progress is made.  10 ms is a reasonable balance for
+ * observing behaviour.
  * ------------------------------------------------------------------
  */
 #define TYPE_BCM_TIMER "bcm56870-timer"
 OBJECT_DECLARE_SIMPLE_TYPE(BCMTimerState, BCM_TIMER)
 
+/* Tick period in virtual nanoseconds. */
+#define BCM_TIMER_TICK_NS  (10 * 1000 * 1000)
+
+/* The scheduler tick is published on IRQ 8, as the firmware itself sets up. */
+#define BCM_TIMER_IRQ      8
+
 struct BCMTimerState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
+
+    QEMUTimer tick;
+    qemu_irq irq;
+
+    uint32_t regs[BCM_TIMER_SIZE / 4];
+    uint32_t counter;
+    bool enabled;
 };
+
+static void timer_tick(void *opaque)
+{
+    BCMTimerState *s = BCM_TIMER(opaque);
+
+    /* The counter is free-running and always advances. */
+    s->counter++;
+
+    if (s->enabled) {
+        /*
+         * Raise the line and leave it high.  The controller latches the
+         * request into its pending bitmap and releases the input again as
+         * part of the acknowledge, so this is an edge-style request from the
+         * timer's point of view even though the line is held in between.
+         */
+        qemu_irq_raise(s->irq);
+    }
+
+    timer_mod(&s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+              + BCM_TIMER_TICK_NS);
+}
 
 static uint64_t timer_read(void *opaque, hwaddr offset, unsigned size)
 {
-    return 0;
+    BCMTimerState *s = BCM_TIMER(opaque);
+    unsigned idx = offset >> 2;
+
+    if (idx >= BCM_TIMER_SIZE / 4) {
+        return 0;
+    }
+
+    /*
+     * The live counter.  The firmware's own block pointer is 0x00082020 while
+     * mos_uptime_ticks() reads 0x00082004: the same register seen as +0x04
+     * from 0x82000, or +0x24 from 0x82020.
+     */
+    if (offset == 0x004 || offset == 0x024) {
+        return s->counter;
+    }
+
+    return s->regs[idx];
 }
 
 static void timer_write(void *opaque, hwaddr offset, uint64_t value,
                         unsigned size)
 {
-    /* ignored */
+    BCMTimerState *s = BCM_TIMER(opaque);
+    unsigned idx = offset >> 2;
+
+    if (idx >= BCM_TIMER_SIZE / 4) {
+        return;
+    }
+
+    /*
+     * +0x04 is the counter itself.  The firmware seeds it by writing 1 during
+     * bring-up; accept that as a starting value, then keep counting.
+     */
+    if (offset == 0x004) {
+        s->counter = value;
+        return;
+    }
+
+    s->regs[idx] = value;
+
+    if (offset == 0x00c) {
+        /* Control: once set, the block delivers periodic interrupts. */
+        s->enabled = (value != 0);
+    }
 }
 
 static const MemoryRegionOps timer_ops = {
@@ -266,21 +595,38 @@ static const MemoryRegionOps timer_ops = {
     .write = timer_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
-    .impl = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
 static void timer_realize(DeviceState *dev, Error **errp)
 {
     BCMTimerState *s = BCM_TIMER(dev);
+
     memory_region_init_io(&s->iomem, OBJECT(s), &timer_ops, s,
                           TYPE_BCM_TIMER, BCM_TIMER_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+    timer_init_ns(&s->tick, QEMU_CLOCK_VIRTUAL, timer_tick, s);
+}
+
+static void timer_reset(DeviceState *dev)
+{
+    BCMTimerState *s = BCM_TIMER(dev);
+
+    memset(s->regs, 0, sizeof(s->regs));
+    s->counter = 0;
+    s->enabled = false;
+    timer_del(&s->tick);
+    timer_mod(&s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+              + BCM_TIMER_TICK_NS);
 }
 
 static void timer_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = timer_realize;
+    device_class_set_legacy_reset(dc, timer_reset);
     dc->user_creatable = false;
 }
 
@@ -304,6 +650,9 @@ struct BCM56870State {
 
     BCMIntcState *intc;
     BCMTimerState *timer;
+    SerialMM *uart0;
+    SerialMM *uart1;
+    SerialMM *uart2;
 };
 
 #define TYPE_BCM56870_MACHINE MACHINE_TYPE_NAME("bcm56870")
@@ -332,38 +681,63 @@ static void bcm56870_init(MachineState *machine)
     memory_region_add_subregion(sysmem, BCM_SYS_BASE, &s->sysram);
 
     /*
-     * --- Interrupt controller -------------------------------------
-     * Created before the UART so the UART can be wired to an INTC input.
+     * --- Interrupt controller --------------------------------------
+     * Created first, because the timer and UARTs route their interrupt lines
+     * into it.  mmio[0] is the control block at 0x00080000; mmio[1] and
+     * mmio[2] are the two enable/pending bitmap windows that irq_dispatch()
+     * scans, at 0x18320000 and 0x18330000.
      */
     dev = qdev_new(TYPE_BCM_INTC);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, BCM_INTC_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, 0x18320000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 2, 0x18330000);
     s->intc = BCM_INTC(dev);
 
+    /* The controller's single output drives the CPU's IRQ input. */
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(DEVICE(s->cpu), ARM_CPU_IRQ));
 
-    /* --- System timer --------------------------------------------- */
+    /* --- System timer ---------------------------------------------- */
     dev = qdev_new(TYPE_BCM_TIMER);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, BCM_TIMER_BASE);
+    /*
+     * The firmware publishes this timer on IRQ 8 (board_init_thread ORs 0x100
+     * into the enable bitmap and installs handler 0x6B1 in descriptor 8).
+     */
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in_named(DEVICE(s->intc), "src",
+                                              BCM_TIMER_IRQ));
     s->timer = BCM_TIMER(dev);
 
-    /* --- Chip ID -------------------------------------------------- */
+    /* --- Chip ID --------------------------------------------------- */
     dev = qdev_new(TYPE_BCM_CHIPID);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, BCM_CHIPID_BASE);
 
-    /* --- UARTs (16550-compatible) --------------------------------- */
     /*
+     * --- UARTs (16550-compatible) ----------------------------------
+     *
      * 16550-compatible UARTs with a 4-byte register stride: the firmware
-     * writes THR at +0x00 and polls LSR (THRE/TEMT) at +0x14, i.e.
-     * register 5, so regshift is 2 (5 << 2 == 0x14).  With regshift 0 the
-     * LSR would sit at +0x05 and the firmware's ready-poll would never
-     * succeed, leaving the console thread stuck in a delay loop.
+     * writes THR at +0x00 and polls LSR (THRE/TEMT) at +0x14, i.e. register 5,
+     * so regshift is 2 (5 << 2 == 0x14).  With regshift 0 the LSR would sit at
+     * +0x05 and the firmware's ready-poll would never succeed, leaving the
+     * console thread stuck in a delay loop.
+     *
+     * Each is wired to the interrupt line the firmware registers it on.  The
+     * console's line matters most: its ISR (FUN_00003278) is what drains the
+     * receive FIFO into the ring buffer that console_getc() reads, so without
+     * it the CLI never sees typed input.
      */
-    serial_mm_init(sysmem, BCM_UART0_BASE, 2, 0,
-                   1843200, serial_hd(0), DEVICE_LITTLE_ENDIAN);
-    serial_mm_init(sysmem, BCM_UART1_BASE, 2, 0,
-                   1843200, serial_hd(1), DEVICE_LITTLE_ENDIAN);
+    s->uart0 = serial_mm_init(sysmem, BCM_UART0_BASE, 2,
+                              qdev_get_gpio_in_named(DEVICE(s->intc), "src",
+                                                     BCM_UART0_IRQ),
+                              1843200, serial_hd(0), DEVICE_LITTLE_ENDIAN);
+    s->uart1 = serial_mm_init(sysmem, BCM_UART1_BASE, 2,
+                              qdev_get_gpio_in_named(DEVICE(s->intc), "src",
+                                                     BCM_UART1_IRQ),
+                              1843200, serial_hd(1), DEVICE_LITTLE_ENDIAN);
 
     /* --- Mark remaining device windows as unimplemented ----------- */
     create_unimplemented_device("bcm56870.pktdma", 0x03205000, 0x1000);
@@ -372,24 +746,22 @@ static void bcm56870_init(MachineState *machine)
     create_unimplemented_device("bcm56870.pinmux", 0x03241700, 0x100);
     create_unimplemented_device("bcm56870.cmic", 0x00030300, 0x100);
     /*
-     * Fallback console when the detected device type is neither 1 nor 2.
+     * --- Fallback console UART at 0x00084000 ------------------------
      *
-     * The image's device-type byte (0xB0) is 0, so FUN_0000335c takes the
-     * "else" path and uses 0x00084000 as the console block, then polls
-     * [base+0x14] (LSR) for THRE|TEMT before transmitting.  Modelling this
-     * window as unimplemented makes LSR read 0, the ready-poll never
-     * succeeds, and the console thread spins in delay(1000) forever with no
-     * output.  So this must be a real 16550-compatible UART too.
+     * The image's device-type byte (offset 0xB0) is 0, so the UART setup
+     * routine takes its "else" branch and uses 0x84000 as the console block
+     * (types 1 and 2 would select 0x03220000 / 0x03221000).  It polls
+     * [base+0x14] (LSR) for THRE|TEMT before transmitting, so this must be a
+     * real 16550: if it is left unimplemented, LSR reads 0 and the console
+     * thread spins in delay(1000) forever with no output at all.
+     *
+     * Its interrupt line is 16, which is the value the firmware registers the
+     * console ISR on.
      */
-    serial_mm_init(sysmem, 0x00084000, 2, 0,
-                   1843200, serial_hd(2), DEVICE_LITTLE_ENDIAN);
-    /*
-     * Interrupt enable/pending bitmap banks.  Unmodelled hardware: accesses
-     * are ignored (RAZ/WI) rather than backed by storage, so the guest cannot
-     * be misled into thinking it has configured a real interrupt controller.
-     */
-    create_unimplemented_device("bcm56870.irqbm0", 0x18320000, 0x1000);
-    create_unimplemented_device("bcm56870.irqbm1", 0x18330000, 0x1000);
+    s->uart2 = serial_mm_init(sysmem, BCM_CONSOLE_BASE, 2,
+                              qdev_get_gpio_in_named(DEVICE(s->intc), "src",
+                                                     BCM_CONSOLE_IRQ),
+                              1843200, serial_hd(2), DEVICE_LITTLE_ENDIAN);
 
     /* --- Load the firmware ---------------------------------------- */
     /*
