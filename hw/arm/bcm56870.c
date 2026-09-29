@@ -52,21 +52,36 @@
 /* Sizes                                                              */
 /* ------------------------------------------------------------------ */
 /*
- * Low RAM: ITCM + the unmapped hole + DTCM, modelled as one flat block.
+ * THE THREE LOW-MEMORY REGIONS ARE MAPPED SEPARATELY, because that is what the part
+ * has and what the firmware expects:
  *
- * Architecturally these are separate (ITCM at 0x0, DTCM at 0x40000, with an
- * unbacked 0x20000..0x3FFFF gap), but the firmware image is a single flat
- * object spanning 0x0..0x4068F and its Reset code zero-fills across the gap.
- * Modelling them as one region keeps the load trivial and matches how the
- * image is actually delivered; the names below record the real boundaries.
+ *   0x00000000 - 0x0001FFFF   ITCM   128 KiB   executable
+ *   0x00020000 - 0x0003FFFF   GAP    UNBACKED
+ *   0x00040000 - 0x0007FFFF   DTCM   256 KiB   data
+ *
+ * This started as a single flat 512 KiB block covering 0x0..0x7FFFF, on the reasoning
+ * that the firmware image is one flat object spanning 0x0..0x4068F.  THAT REASONING WAS
+ * WRONG, and it mattered: the flat mapping silently accepts a program that locates its
+ * own data in the gap, which the real part cannot do.  A reconstruction of this firmware
+ * duly did exactly that -- .rodata, .data and .bss at 0x1E4AC..0x35978 -- and ran only
+ * because of the shortcut.
+ *
+ * THE FIRMWARE'S OWN RESET SETTLES IT.  It zero-fills three ranges, taken from its
+ * literal pool at 0x204/0x20C/0x210/0x218/0x220/0x224:
+ *
+ *     0x10430 .. 0x20000     (stops at the ITCM boundary)
+ *     0x40690 .. 0x80000     (resumes at the end of the image, inside DTCM)
+ *     0x5C520 .. 0x80000
+ *
+ * The gap is SKIPPED ENTIRELY, so the firmware behaves exactly as if it were unbacked.
+ * Modelling it as unbacked is therefore the faithful choice, not a simplification.
  */
 #define BCM_ITCM_BASE   0x00000000
-#define BCM_ITCM_SIZE   0x00020000   /* 128 KiB: code + rodata + BSS tail */
+#define BCM_ITCM_SIZE   0x00020000   /* 128 KiB: code */
+#define BCM_GAP_BASE    0x00020000
+#define BCM_GAP_SIZE    0x00020000   /* unbacked; no region is registered */
 #define BCM_DTCM_BASE   0x00040000
 #define BCM_DTCM_SIZE   0x00040000   /* 256 KiB: data + BSS + heap pools */
-
-#define BCM_LOWRAM_BASE 0x00000000
-#define BCM_LOWRAM_SIZE 0x00080000   /* 0x0..0x7FFFF flat */
 
 #define BCM_SYS_BASE    0x01200000
 #define BCM_SYS_SIZE    0x00100000   /* 0x1200000..0x12FFFFF */
@@ -1728,7 +1743,8 @@ struct BCM56870State {
 
     ARMCPU *cpu;
 
-    MemoryRegion lowram;
+    MemoryRegion itcm;
+    MemoryRegion dtcm;
     MemoryRegion sysram;
 
     BCMIntcState *intc;
@@ -1757,10 +1773,19 @@ static void bcm56870_init(MachineState *machine)
         exit(1);
     }
 
-    /* --- RAM ------------------------------------------------------- */
-    memory_region_init_ram(&s->lowram, NULL, "bcm56870.lowram",
-                           BCM_LOWRAM_SIZE, &error_fatal);
-    memory_region_add_subregion(sysmem, BCM_LOWRAM_BASE, &s->lowram);
+    /*
+     * --- RAM -------------------------------------------------------
+     *
+     * ITCM and DTCM are SEPARATE regions with the gap deliberately left unmapped, so a
+     * load or fetch into 0x20000..0x3FFFF faults here exactly as it would on the part.
+     */
+    memory_region_init_ram(&s->itcm, NULL, "bcm56870.itcm",
+                           BCM_ITCM_SIZE, &error_fatal);
+    memory_region_add_subregion(sysmem, BCM_ITCM_BASE, &s->itcm);
+
+    memory_region_init_ram(&s->dtcm, NULL, "bcm56870.dtcm",
+                           BCM_DTCM_SIZE, &error_fatal);
+    memory_region_add_subregion(sysmem, BCM_DTCM_BASE, &s->dtcm);
 
     memory_region_init_ram(&s->sysram, NULL, "bcm56870.sys",
                            BCM_SYS_SIZE, &error_fatal);
@@ -1899,21 +1924,24 @@ static void bcm56870_init(MachineState *machine)
 
     /* --- Load the firmware ---------------------------------------- */
     /*
-     * The file is a flat image covering 0x0..0x4068F: it starts in ITCM
-     * (0x0..0x1FFFF), is all-zero across the 0x20000..0x3FFFF hole, and
-     * ends inside DTCM (0x40000..0x4068F).  A single load_image_targphys()
-     * cannot express that, because its max_sz must bound the whole file
-     * while each region is mapped separately here.  So read the file once
-     * and copy each part into the region that owns it.
+     * The file is a flat image: ITCM at 0x0, then (usually) all-zero bytes across the
+     * gap, then DTCM.  It is copied into the region that owns each part, and the part
+     * that falls in the GAP IS DELIBERATELY NOT LOADED -- if an image depends on the gap
+     * being writable, that dependency is a bug in the image and this loader now refuses
+     * to hide it.
      *
-     * -kernel is deliberately NOT used: arm_load_kernel() would try to
-     * load the file itself (and fail, since it does not fit one region),
-     * so we take the path entirely and just set the reset PC.
+     * A SINGLE load_image_targphys() cannot express this: its max_sz must bound the whole
+     * file while the regions are mapped separately.  So read once and copy per region.
+     *
+     * -kernel is deliberately NOT used: arm_load_kernel() would try to load the file
+     * itself (and fail, since it does not fit one region), so we take that path entirely
+     * and just set the reset PC.
      */
     {
         gsize fsize = 0;
         gchar *fbuf = NULL;
         GError *gerr = NULL;
+        gsize itcm_len, dtcm_off, dtcm_len, gap_len;
 
         if (!machine->kernel_filename) {
             error_report("bcm56870: -kernel <firmware.bin> is required");
@@ -1926,17 +1954,58 @@ static void bcm56870_init(MachineState *machine)
             exit(1);
         }
 
-        /* The whole image lives in the flat low RAM block. */
-        if (fsize > BCM_LOWRAM_SIZE) {
-            error_report("bcm56870: image is %zu bytes, larger than low RAM "
-                         "(%u bytes)", (size_t)fsize, BCM_LOWRAM_SIZE);
+        if (fsize > BCM_DTCM_BASE + BCM_DTCM_SIZE) {
+            error_report("bcm56870: image is %zu bytes, larger than ITCM+DTCM "
+                         "(0x%X)", (size_t)fsize, BCM_DTCM_BASE + BCM_DTCM_SIZE);
             exit(1);
         }
-        address_space_write(&address_space_memory, BCM_LOWRAM_BASE,
-                            MEMTXATTRS_UNSPECIFIED, fbuf, fsize);
 
-        qemu_log_mask(LOG_UNIMP, "bcm56870: loaded %s (%zu bytes)\n",
-                      machine->kernel_filename, (size_t)fsize);
+        /* ITCM: 0x0..0x1FFFF. */
+        itcm_len = MIN(fsize, (gsize)BCM_ITCM_SIZE);
+        address_space_write(&address_space_memory, BCM_ITCM_BASE,
+                            MEMTXATTRS_UNSPECIFIED, fbuf, itcm_len);
+
+        /*
+         * THE GAP: 0x20000..0x3FFFF.  Bytes an image places here are CHECKED and
+         * REPORTED.  All-zero padding is normal -- objcopy fills the hole when the image
+         * is linked in two pieces -- but non-zero content means the program really is
+         * using the gap, which the hardware does not back.
+         */
+        gap_len = 0;
+        if (fsize > BCM_ITCM_SIZE) {
+            gsize lo = BCM_ITCM_SIZE;
+            gsize hi = MIN(fsize, (gsize)BCM_DTCM_BASE);
+            gsize i;
+
+            gap_len = hi - lo;
+            for (i = lo; i < hi; i++) {
+                if (fbuf[i] != 0) {
+                    error_report("bcm56870: image has non-zero content in the "
+                                 "UNBACKED gap at 0x%zx (byte 0x%02x). The gap is "
+                                 "not RAM on this part; move the data into ITCM "
+                                 "(< 0x20000) or DTCM (>= 0x40000).",
+                                 i, (unsigned char)fbuf[i]);
+                    exit(1);
+                }
+            }
+        }
+
+        /* DTCM: 0x40000..0x7FFFF. */
+        dtcm_off = 0;
+        dtcm_len = 0;
+        if (fsize > BCM_DTCM_BASE) {
+            dtcm_off = BCM_DTCM_BASE;
+            dtcm_len = fsize - BCM_DTCM_BASE;
+            address_space_write(&address_space_memory, BCM_DTCM_BASE,
+                                MEMTXATTRS_UNSPECIFIED, fbuf + dtcm_off,
+                                dtcm_len);
+        }
+
+        qemu_log_mask(LOG_UNIMP,
+                      "bcm56870: loaded %s (%zu bytes: ITCM %zu, gap %zu, "
+                      "DTCM %zu)\n",
+                      machine->kernel_filename, (size_t)fsize,
+                      itcm_len, gap_len, dtcm_len);
         g_free(fbuf);
 
         /*
@@ -1958,7 +2027,7 @@ static void bcm56870_init(MachineState *machine)
         static struct arm_boot_info binfo;
 
         binfo.loader_start = BCM_ITCM_BASE;
-        binfo.ram_size = BCM_LOWRAM_SIZE;
+        binfo.ram_size = BCM_ITCM_SIZE;
         binfo.board_id = -1;
         arm_load_kernel(s->cpu, machine, &binfo);
     }
